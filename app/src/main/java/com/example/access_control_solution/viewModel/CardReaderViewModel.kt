@@ -1,0 +1,859 @@
+package com.example.access_control_solution.viewModel
+
+import android.app.Application
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
+import android.net.Uri
+import android.os.Looper
+import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.AndroidViewModel
+import androidx.room.concurrent.AtomicBoolean
+import com.example.access_control_solution.data.AppDatabase
+import com.example.access_control_solution.data.ProfileEntity
+import com.example.neurotecsdklibrary.NeurotecLicenseHelper
+import com.neurotec.biometrics.NBiometricCaptureOption
+import com.neurotec.biometrics.NBiometricOperation
+import com.neurotec.biometrics.NBiometricStatus
+import com.neurotec.biometrics.NFace
+import com.neurotec.biometrics.NSubject
+import com.neurotec.biometrics.client.NBiometricClient
+import com.neurotec.devices.NCamera
+import com.neurotec.devices.NDeviceType
+import com.neurotec.images.NImage
+import com.neurotec.io.NBuffer
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.InputStream
+import java.util.EnumSet
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+
+data class FaceDetectionFeedback(
+    val lightingStatus: LightingStatus = LightingStatus.UNKNOWN,
+    val distanceStatus: DistanceStatus = DistanceStatus.UNKNOWN,
+    val positionStatus: PositionStatus = PositionStatus.UNKNOWN,
+    val qualityStatus: QualityStatus = QualityStatus.UNKNOWN,
+    val overallMessage: String = "Position your face in view"
+)
+
+enum class LightingStatus {
+    GOOD, UNKNOWN
+}
+
+enum class DistanceStatus {
+    GOOD, UNKNOWN
+}
+
+enum class PositionStatus {
+    CENTERED, UNKNOWN
+}
+
+enum class QualityStatus {
+    EXCELLENT, UNKNOWN
+}
+
+class CardReaderViewModel(application: Application) : AndroidViewModel(application) {
+    data class DialogState(
+        val showDialog: Boolean = false,
+        val message: String = "",
+        val capturedFace: Bitmap? = null
+    )
+
+    // Private mutable state - only this viewModel can change it
+    private val _dialogState = MutableStateFlow(DialogState())
+    // Public read-only state - UI can observe but not modify
+    val dialogState: StateFlow<DialogState> = _dialogState.asStateFlow()
+
+    private val main = android.os.Handler(Looper.getMainLooper())
+    private val executor = Executors.newSingleThreadExecutor()
+
+    private val dbExecutor = Executors.newSingleThreadExecutor()
+
+    var status by mutableStateOf("")
+        private set
+
+    var biometricClient: NBiometricClient? = null
+        private set
+
+    var isCapturing by mutableStateOf(false)
+        private set
+
+    var currentSubject: NSubject? = null
+        private set
+
+    var detectionFeedback by mutableStateOf(FaceDetectionFeedback())
+        private set
+
+    var useNeurotecCamera by mutableStateOf(true)
+        private set
+
+    // Callback property for sound
+    var onFaceDetectedSound: (() -> Unit)? = null
+
+    private val cameras = mutableListOf<NCamera>()
+    private var activeCameraIndex = 0
+
+    private var isInitialized = false
+
+    private var captureInProgress = false
+
+
+    var capturedProfileFace: Bitmap? by mutableStateOf(null)
+        private set
+
+    var capturedProfileTemplate: ByteArray? = null
+        private set
+
+    private var cachedProfiles: List<ProfileEntity>? = null
+    private var cacheTimestamp: Long = 0
+    private val CACHE_DURATION_MS = 30000L  // 30 seconds cache
+
+    fun initialize() {
+        if (isInitialized) {
+            startAutomaticCapture()
+            return
+        }
+
+        executor.execute {
+            try {
+                NeurotecLicenseHelper.obtainFaceLicenses(getApplication())
+                initClient()
+                main.post {
+                    if (isInitialized) {
+                        startAutomaticCapture()
+                    }
+                }
+            } catch (e: Exception) {
+                main.post { status = "License Error: ${e.message}" }
+            }
+        }
+    }
+
+    private fun initClient() {
+        try {
+            biometricClient = NBiometricClient().apply {
+                setFacesDetectProperties(true)
+                isUseDeviceManager = true
+                deviceManager.deviceTypes = EnumSet.of(NDeviceType.CAMERA)
+
+                facesQualityThreshold = 50
+                facesConfidenceThreshold = 1
+
+                // Disable features that needs the missing models
+                setProperty("Faces.DetectAllFeaturePoints", "false")
+                setProperty("Faces.RecognizeExpression", "false")
+
+                initialize()
+            }
+
+            val cameras = biometricClient?.deviceManager?.devices ?: emptyList()
+            this.cameras.clear()
+
+            cameras.forEach { device ->
+                if (device is NCamera) {
+                    this.cameras.add(device)
+                    Log.d("NeurotecCamera", "Detected camera: ${device.displayName}")
+                }
+
+            }
+
+            if (this.cameras.isEmpty()) {
+                main.post { status = "No camera found"}
+                return
+            }
+
+            activeCameraIndex = 0
+            biometricClient?.faceCaptureDevice = this.cameras[activeCameraIndex]
+
+            isInitialized = true
+
+            main.postDelayed({
+                startAutomaticCapture()
+            }, 300)
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Camera initialization error", e)
+            main.post { status = "Camera initialization error: ${e.message}" }
+        }
+    }
+
+    fun startAutomaticCapture() {
+
+        if (captureInProgress || !isInitialized) {
+            Log.d("CardReaderViewModel", "Capture already in progress or not initialized")
+            return
+        }
+
+        executor.execute {
+            try {
+                captureInProgress = true
+                main.post {
+                    isCapturing = true
+                    detectionFeedback = FaceDetectionFeedback(
+                        overallMessage = "Looking for face..."
+                    )
+                }
+
+                Log.d("CardReaderViewModel", "Starting automatic capture...")
+
+                val subject = NSubject()
+                val face = NFace().apply {
+                    captureOptions = EnumSet.of(NBiometricCaptureOption.STREAM)
+                }
+
+                subject.faces.add(face)
+                main.post { currentSubject = subject }
+
+                val task = biometricClient?.createTask(
+                    EnumSet.of(NBiometricOperation.CAPTURE, NBiometricOperation.CREATE_TEMPLATE),
+                    subject
+                )
+
+                task?.let { biometricClient?.performTask(it) }
+
+                val taskStatus = task?.status
+
+                Log.d("CardReaderViewModel", "Capture task status: $taskStatus")
+
+                when (taskStatus) {
+                    NBiometricStatus.OK -> {
+                        Log.d("CardReaderViewModel", "Face captured successfully!")
+
+                        // Extract face image
+                        val faceImage = subject.faces.firstOrNull()?.image
+                        val bitmap = faceImage?.let { convertNImageToBitmap(it) }
+
+                        // Extract and store the template for verification
+                        val template = subject.templateBuffer?.toByteArray()
+                        if (template != null) {
+                            capturedProfileFace = bitmap
+                            capturedProfileTemplate = template
+                            Log.d("CardReaderViewModel", "Template saved for verification, size: ${template.size}")
+                        } else {
+                            Log.e("CardReaderViewModel", "Failed to extract template!")
+                        }
+
+                        main.post {
+                            onFaceDetectedSound?.invoke()
+                            status = "Face captured successfully!"
+                            detectionFeedback = FaceDetectionFeedback(
+                                lightingStatus = LightingStatus.GOOD,
+                                distanceStatus = DistanceStatus.GOOD,
+                                positionStatus = PositionStatus.CENTERED,
+                                qualityStatus = QualityStatus.EXCELLENT,
+                                overallMessage = "Perfect! Face captured!"
+                            )
+
+                            // Show dialog with captured face
+                            showFaceDetectedDialog(bitmap)
+                        }
+
+                        captureInProgress
+                    }
+
+                    NBiometricStatus.TIMEOUT,
+                    NBiometricStatus.BAD_OBJECT -> {
+                        Log.w("CardReaderViewModel", "No face detected, retrying...")
+                        main.post {
+                            status = "No face detected. Please position your face..."
+                            detectionFeedback = FaceDetectionFeedback(
+                                overallMessage = "No face detected. Please try again..."
+                            )
+                        }
+
+                        captureInProgress = false
+                        main.postDelayed({ startAutomaticCapture() }, 500)
+                    }
+
+                    else -> {
+                        Log.w("CardReaderViewModel", "Capture failed: $taskStatus")
+                        main.post {
+                            detectionFeedback = FaceDetectionFeedback(
+                                overallMessage = "Detection failed. Retrying..."
+                            )
+                        }
+
+                        captureInProgress = false
+                        main.postDelayed({ startAutomaticCapture() }, 800)
+                    }
+                }
+
+                task?.dispose()
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error during capture", e)
+                captureInProgress = false
+                main.post {
+                    isCapturing = false
+                    status = "Capture error. Retrying..."
+                    detectionFeedback = FaceDetectionFeedback(
+                        overallMessage = "Error occurred. Retrying..."
+                    )
+                    main.postDelayed({ startAutomaticCapture() }, 1000)
+                }
+            }
+        }
+    }
+
+    private fun convertNImageToBitmap(nImage: NImage): Bitmap? {
+        return try {
+            val bitmap = nImage.toBitmap()
+            Log.d("CardReaderViewModel", "Converted to bitmap: ${bitmap.width}x${bitmap.height}")
+            bitmap
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Error converting NImage to Bitmap", e)
+            null
+        }
+    }
+
+
+    fun toggleCameraPreview() {
+        if (cameras.size < 2) {
+            status = "Only one camera available"
+            return
+        }
+        stopCapture()
+        activeCameraIndex = (activeCameraIndex + 1) % cameras.size
+        biometricClient?.faceCaptureDevice = cameras[activeCameraIndex]
+        status = "Switched to ${cameras[activeCameraIndex].displayName}"
+        startAutomaticCapture()
+    }
+
+    fun stopCapture() {
+        captureInProgress = false
+        isCapturing = false
+
+        // Cancel any pending capture operations
+        try {
+            currentSubject?.faces?.clear()
+            currentSubject = null
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Error clearing subject", e)
+        }
+    }
+
+    private fun showFaceDetectedDialog(faceBitmap: Bitmap?) {
+        _dialogState.value = DialogState(
+            showDialog = true,
+            message = "Face Detected Successfully",
+            capturedFace = faceBitmap
+        )
+    }
+
+    fun hideDialog() {
+        _dialogState.value = DialogState(
+            showDialog = false,
+            message = "",
+            capturedFace = null
+        )
+    }
+
+    fun reset() {
+        stopCapture()
+        hideDialog()
+        status = ""
+        detectionFeedback = FaceDetectionFeedback()
+        isInitialized = false
+    }
+
+    fun saveProfile(
+        name: String,
+        lagId: String,
+        faceTemplate: ByteArray,
+        faceImage: ByteArray,
+        onSuccess: (Long) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        dbExecutor.execute {
+            try {
+                Log.d("CardReaderViewModel", "Saving profile: $name, LAG ID: $lagId")
+                main.post { status = "Saving profile..." }
+
+                val compressedImage = compressFaceImage(faceImage)
+
+                val profileEntity = ProfileEntity(
+                    name = name,
+                    lagId = lagId,
+                    faceTemplate = faceTemplate,
+                    faceImage = compressedImage
+                )
+
+                val profileId = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .insert(profileEntity)
+
+                // Invalidate cache after save
+                cachedProfiles = null
+
+                Log.d("CardReaderViewModel", "Profile saved with ID: $profileId")
+
+                main.post {
+                    status = "Profile saved successfully!"
+                    onSuccess(profileId)
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error saving profile", e)
+                main.post {
+                    status = "Error saving profile: ${e.message}"
+                    onError(e.message ?: "Unknown error")
+                }
+            }
+        }
+    }
+
+
+    // Helper function to compress face image more efficiently
+    private fun compressFaceImage(imageBytes: ByteArray): ByteArray {
+        return try {
+            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
+            // Resize if too large (max 300x300 for storage)
+            val resizedBitmap = if (bitmap.width > 300 || bitmap.height > 300) {
+                val ratio = minOf(300f / bitmap.width, 300f / bitmap.height)
+                val newWidth = (bitmap.width * ratio).toInt()
+                val newHeight = (bitmap.height * ratio).toInt()
+                Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+            } else {
+                bitmap
+            }
+
+            // Compress with lower quality for storage
+            val stream = java.io.ByteArrayOutputStream()
+            resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 75, stream)
+            val compressed = stream.toByteArray()
+            stream.close()
+
+            if (bitmap != resizedBitmap) {
+                resizedBitmap.recycle()
+            }
+            bitmap.recycle()
+
+            Log.d("CardReaderViewModel", "Image compressed from ${imageBytes.size} to ${compressed.size} bytes")
+            compressed
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Error compressing image", e)
+            imageBytes // Return original if compression fails
+        }
+    }
+
+    fun getAllProfile(callback: (List<ProfileEntity>) -> Unit, forceRefresh: Boolean = false) {
+
+        // Return cached data if still fresh
+        if (!forceRefresh && cachedProfiles != null &&
+                (System.currentTimeMillis() - cacheTimestamp) < CACHE_DURATION_MS) {
+            Log.d("CardReaderViewModel", "Returning cached profiles")
+            main.post { callback(cachedProfiles!!)}
+            return
+        }
+        dbExecutor.execute {
+            try {
+                val startTime = System.currentTimeMillis()
+                // Load essential data
+                val profileList = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getAllProfile()
+
+                cachedProfiles = profileList
+                cacheTimestamp = System.currentTimeMillis()
+
+                main.post {
+                    callback(profileList)
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error getting profile", e)
+                main.post { callback(emptyList()) }
+            }
+        }
+    }
+
+    fun deleteProfile(profileId: Long, onComplete: () -> Unit) {
+        executor.execute {
+            try {
+                val profile = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getProfileById(profileId)
+
+                profile?.let { profileToDelete ->
+                    AppDatabase.getInstance(getApplication())
+                        .profileDao()
+                        .delete(profileToDelete)
+
+                    // Invalidate cache after delete
+                    cachedProfiles = null
+
+                    main.post {
+                        status = "Profile deleted"
+                        onComplete()
+                    }
+                } ?: run {
+                    main.post {
+                        status = "Profile not found"
+                        onComplete()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error deleting profile", e)
+                main.post { onComplete() }
+            }
+        }
+    }
+
+    fun verifyFaceAgainstDatabase(onResult: (ProfileEntity?, Int) -> Unit) {
+        executor.execute {
+            try {
+                main.post { status = "Searching database..." }
+
+                // Get the captured face template
+                val capturedTemplate = capturedProfileTemplate
+                if (capturedTemplate == null) {
+                    main.post {
+                        status = "No captured face found"
+                        onResult(null, 0)
+                    }
+                    return@execute
+                }
+
+                // Get all staff from database
+                val allProfile = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getAllProfile()
+
+                if (allProfile.isEmpty()) {
+                    main.post {
+                        status = "No profile in database"
+                        onResult(null, 0)
+                    }
+                    return@execute
+                }
+
+                main.post { status = "Comparing with ${allProfile.size} profiles..." }
+
+                // Create subject for captured face
+                val capturedSubject = NSubject()
+                capturedSubject.setTemplateBuffer(NBuffer(capturedTemplate))
+
+                var bestMatch: ProfileEntity? = null
+                var bestScore = 0
+
+                // Match against each staff profile
+                allProfile.forEachIndexed { index, profile ->
+                    try {
+                        val profileSubject = NSubject()
+                        profileSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
+
+                        val matchStatus = biometricClient?.verify(capturedSubject, profileSubject)
+
+                        if (matchStatus == NBiometricStatus.OK) {
+                            val score = capturedSubject.matchingResults?.getOrNull(0)?.score ?: 0
+                            if (score > bestScore) {
+                                bestScore = score
+                                bestMatch = profile
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
+                    }
+                }
+
+                val threshold = 48
+                val finalMatch = if (bestScore >= threshold) bestMatch else null
+
+                main.post {
+                    status = if (finalMatch != null) {
+                        "Match found: ${finalMatch.name} (Score: $bestScore)"
+                    } else if (bestScore > 0) {
+                        "No match found (Best score: $bestScore)"
+                    } else {
+                        "No match found"
+                    }
+                    onResult(finalMatch, bestScore)
+                }
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error during verification", e)
+                main.post {
+                    status = "Verification error: ${e.message}"
+                    onResult(null, 0)
+                }
+            }
+        }
+    }
+
+
+    private fun fixImageOrientation(context: Context, uri: Uri, bitmap: Bitmap): Bitmap {
+        return try {
+            val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
+            val exif = inputStream?.let { ExifInterface(it) }
+            inputStream?.close()
+
+            val orientation = exif?.getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            ) ?: ExifInterface.ORIENTATION_NORMAL
+
+            val matrix = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+            }
+
+            if (!matrix.isIdentity) {
+                Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            } else {
+                bitmap
+            }
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Error fixing image orientation", e)
+            bitmap
+        }
+    }
+
+    fun processFaceFromUri(
+        context: Context,
+        uri: Uri,
+        onSuccess: (Bitmap, ByteArray) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        executor.execute {
+            try {
+                // Stop any ongoing capture to avoid conflicts
+                stopCapture()
+
+                main.post { status = "Loading image..." }
+
+                // Read image from URI with options for faster decoding
+                val inputStream = context.contentResolver.openInputStream(uri)
+                val options = BitmapFactory.Options().apply {
+                    inJustDecodeBounds = false
+                    inSampleSize = calculateInSampleSize(this, 512, 512)
+                }
+
+                val originalBitmap = BitmapFactory.decodeStream(inputStream, null, options)
+                inputStream?.close()
+
+                if (originalBitmap == null) {
+                    main.post {
+                        status = "Failed to read image"
+                        onError("Failed to read image from gallery")
+                    }
+                    return@execute
+                }
+
+                // Fix orientation
+                val rotatedBitmap = fixImageOrientation(context, uri, originalBitmap)
+
+                // Show the image immediately
+                main.post {
+                    capturedProfileFace = rotatedBitmap
+                    status = "Detecting face..."
+                }
+
+                // Ensure biometric client is initialized
+                if (biometricClient == null) {
+                    Log.w("CardReaderViewModel", "Biometric client not initialized, initializing now...")
+                    try {
+                        NeurotecLicenseHelper.obtainFaceLicenses(context)
+                        // Initialize on main thread
+                        main.post { initClient() }
+                        // Wait for initialization
+                    } catch (e: Exception) {
+                        Log.e("CardReaderViewModel", "License initialization error", e)
+                    }
+                }
+
+                if (biometricClient == null) {
+                    main.post {
+                        status = "System not ready"
+                        onError("Face detection system not initialized. Please try again.")
+                    }
+                    return@execute
+                }
+
+                // Convert bitmap to byte array
+                val stream = java.io.ByteArrayOutputStream()
+                rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+                val imageBytes = stream.toByteArray()
+                stream.close()
+
+                // Process the face
+                processFaceFromImage(imageBytes, rotatedBitmap, onSuccess, onError)
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error in processFaceFromUri", e)
+                e.printStackTrace()
+                main.post {
+                    status = "Error: ${e.message}"
+                    onError("Error reading image: ${e.message}")
+                }
+            }
+        }
+    }
+
+    // Helper function to calculate sample size
+    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+        val height = options.outHeight
+        val width = options.outWidth
+        var inSampleSize = 1
+
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth = width / 2
+
+            while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+
+        return inSampleSize
+    }
+
+    fun processFaceFromImage(
+        imageBytes: ByteArray,
+        previewBitmap: Bitmap,
+        onSuccess: (Bitmap, ByteArray) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        try {
+            main.post { status = "Analyzing face..." }
+            Log.d("CardReaderViewModel", "Starting face detection from image")
+
+            // Convert byte array to NImage
+            val nImage = NImage.fromMemory(NBuffer(imageBytes))
+            Log.d("CardReaderViewModel", "NImage created: ${nImage.width}x${nImage.height}")
+
+            // Create subject and face
+            val subject = NSubject()
+            val face = NFace()
+            face.image = nImage
+            subject.faces.add(face)
+
+//            main.post { status = "Extracting template..." }
+
+            // Create task
+            val task = biometricClient?.createTask(
+                EnumSet.of(
+                    NBiometricOperation.DETECT_SEGMENTS,
+                    NBiometricOperation.CREATE_TEMPLATE
+                ),
+                subject
+            )
+
+            task?.let {
+                it.timeout = 15000 // 15 seconds timeout
+                Log.d("CardReaderViewModel", "Performing face detection...")
+                biometricClient?.performTask(it)
+                Log.d("CardReaderViewModel", "Task completed with status: ${it.status}")
+            }
+
+            val taskStatus = task?.status
+
+            when (taskStatus) {
+                NBiometricStatus.OK -> {
+                    val template = subject.templateBuffer?.toByteArray()
+
+                    if (template != null && template.isNotEmpty()) {
+                        Log.d("CardReaderViewModel", "Template extracted, size: ${template.size}")
+                        main.post {
+                            status = "Image uploaded successfully!"
+                            onSuccess(previewBitmap, template)
+                        }
+                    } else {
+                        Log.e("CardReaderViewModel", "Template is null or empty")
+                        main.post {
+                            status = "Failed to create template"
+                            onError("Failed to extract face template from image")
+                        }
+                    }
+                }
+
+                NBiometricStatus.BAD_OBJECT -> {
+                    Log.w("CardReaderViewModel", "No face detected in image")
+                    main.post {
+                        status = "No face detected"
+                        onError("No face detected. Please select a clear photo with a visible face.")
+                    }
+                }
+
+                NBiometricStatus.TIMEOUT -> {
+                    Log.e("CardReaderViewModel", "Face detection timeout")
+                    main.post {
+                        status = "Processing timeout"
+                        onError("Processing took too long. Please try a different photo.")
+                    }
+                }
+
+                else -> {
+                    Log.e("CardReaderViewModel", "Face detection failed: $taskStatus")
+                    main.post {
+                        status = "Detection failed"
+                        onError("Could not detect face. Please try another photo.")
+                    }
+                }
+            }
+
+            // Clean up
+            task?.dispose()
+            nImage.dispose()
+
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Exception in processFaceFromImage", e)
+            e.printStackTrace()
+            main.post {
+                status = "Error: ${e.message}"
+                onError("Error processing face: ${e.message}")
+            }
+        }
+    }
+
+    fun checkLagIdInDatabase(lagId: String, onResult: (ProfileEntity?, Boolean) -> Unit) {
+        executor.execute {
+            try {
+                main.post { status = "Verifying card..." }
+
+                val profile = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getProfileByLagId(lagId)
+
+                val exists = profile != null
+
+                main.post {
+                    status = if (exists) {
+                        "Access Granted: ${profile?.name}"
+                    } else {
+                        "Access Denied: LAG ID not registered"
+                    }
+                    onResult(profile, exists)
+                }
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error checking LAG ID", e)
+                main.post {
+                    status = "Error checking card"
+                    onResult(null, false)
+                }
+            }
+        }
+    }
+
+
+    fun clearCapturedStaffFace() {
+        capturedProfileFace = null
+        capturedProfileTemplate = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        stopCapture()
+        executor.shutdown()
+        biometricClient?.dispose()
+    }
+}
