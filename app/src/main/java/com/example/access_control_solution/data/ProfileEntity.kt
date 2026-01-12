@@ -15,6 +15,7 @@ data class ProfileEntity(
     val lagId: String,
     val faceTemplate: ByteArray,
     val faceImage: ByteArray,
+    val thumbnail: ByteArray? = null,
     val timestamp: Long = System.currentTimeMillis()
 
 ) {

@@ -273,15 +273,18 @@ fun ProfileCard(
                 // Decode in background
                 withContext(Dispatchers.IO) {
                     try {
-                        val options = BitmapFactory.Options().apply {
-                            inSampleSize = 2  // Decode at her size for list display
+                        // Check if thumbnail exists
+                        if (profile.thumbnail != null) {
+                            val options = BitmapFactory.Options().apply {
+                                inSampleSize = 1
+                            }
+                            bitmap = BitmapFactory.decodeByteArray(
+                                profile.thumbnail,
+                                0,
+                                profile.thumbnail.size,
+                                options
+                            )
                         }
-                        bitmap = BitmapFactory.decodeByteArray(
-                            profile.faceImage,
-                            0,
-                            profile.faceImage.size,
-                            options
-                        )
                     } catch (e: Exception) {
                         bitmap = null
                     }

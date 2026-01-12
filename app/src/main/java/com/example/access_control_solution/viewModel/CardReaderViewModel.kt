@@ -30,6 +30,7 @@ import com.neurotec.io.NBuffer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.EnumSet
 import java.util.concurrent.Executor
@@ -376,12 +377,14 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 main.post { status = "Saving profile..." }
 
                 val compressedImage = compressFaceImage(faceImage)
+                val thumbnail = createThumbnail(faceImage)
 
                 val profileEntity = ProfileEntity(
                     name = name,
                     lagId = lagId,
                     faceTemplate = faceTemplate,
-                    faceImage = compressedImage
+                    faceImage = compressedImage,
+                    thumbnail = thumbnail
                 )
 
                 val profileId = AppDatabase.getInstance(getApplication())
@@ -407,6 +410,22 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    private fun createThumbnail(imageBytes: ByteArray): ByteArray {
+        return try {
+            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            val thumbnail = Bitmap.createScaledBitmap(bitmap, 80, 80, true)
+            val stream = ByteArrayOutputStream()
+            thumbnail.compress(Bitmap.CompressFormat.JPEG, 60, stream)
+            val result = stream.toByteArray()
+            stream.close()
+            thumbnail.recycle()
+            bitmap.recycle()
+            result
+        } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Error creating thumbnail", e)
+            imageBytes
+        }
+    }
 
     // Helper function to compress face image more efficiently
     private fun compressFaceImage(imageBytes: ByteArray): ByteArray {
@@ -453,7 +472,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
         dbExecutor.execute {
             try {
-                val startTime = System.currentTimeMillis()
                 // Load essential data
                 val profileList = AppDatabase.getInstance(getApplication())
                     .profileDao()
@@ -473,7 +491,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun deleteProfile(profileId: Long, onComplete: () -> Unit) {
-        executor.execute {
+        dbExecutor.execute {
             try {
                 val profile = AppDatabase.getInstance(getApplication())
                     .profileDao()
