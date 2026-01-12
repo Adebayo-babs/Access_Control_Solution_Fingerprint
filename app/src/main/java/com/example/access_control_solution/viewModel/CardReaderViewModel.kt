@@ -242,7 +242,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
 
                         main.post {
                             onFaceDetectedSound?.invoke()
-                            status = "Face captured successfully!"
+//                            status = "Face captured successfully!"
                             detectionFeedback = FaceDetectionFeedback(
                                 lightingStatus = LightingStatus.GOOD,
                                 distanceStatus = DistanceStatus.GOOD,
@@ -292,7 +292,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 captureInProgress = false
                 main.post {
                     isCapturing = false
-                    status = "Capture error. Retrying..."
+//                    status = "Capture error. Retrying..."
                     detectionFeedback = FaceDetectionFeedback(
                         overallMessage = "Error occurred. Retrying..."
                     )
@@ -371,40 +371,57 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         onSuccess: (Long) -> Unit,
         onError: (String) -> Unit
     ) {
-        dbExecutor.execute {
-            try {
-                Log.d("CardReaderViewModel", "Saving profile: $name, LAG ID: $lagId")
-                main.post { status = "Saving profile..." }
-
-                val compressedImage = compressFaceImage(faceImage)
-                val thumbnail = createThumbnail(faceImage)
-
-                val profileEntity = ProfileEntity(
-                    name = name,
-                    lagId = lagId,
-                    faceTemplate = faceTemplate,
-                    faceImage = compressedImage,
-                    thumbnail = thumbnail
-                )
-
-                val profileId = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .insert(profileEntity)
-
-                // Invalidate cache after save
-                cachedProfiles = null
-
-                Log.d("CardReaderViewModel", "Profile saved with ID: $profileId")
-
-                main.post {
-                    status = "Profile saved successfully!"
-                    onSuccess(profileId)
+        // First check for duplicates
+        checkForDuplicates(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
+            if (isDuplicate) {
+                val errorMsg = when (duplicateType) {
+                    "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
+                    "Face" -> "This face is already registered as ${existingProfile?.name}"
+                    else -> "Profile already exists"
                 }
-            } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error saving profile", e)
                 main.post {
-                    status = "Error saving profile: ${e.message}"
-                    onError(e.message ?: "Unknown error")
+                    status = "Duplicate found"
+                    onError(errorMsg)
+                }
+                return@checkForDuplicates
+            }
+
+            // No duplicates, proceed with saving
+            dbExecutor.execute {
+                try {
+                    Log.d("CardReaderViewModel", "Saving profile: $name, LAG ID: $lagId")
+//                    main.post { status = "Saving profile..." }
+
+                    val compressedImage = compressFaceImage(faceImage)
+                    val thumbnail = createThumbnail(faceImage)
+
+                    val profileEntity = ProfileEntity(
+                        name = name,
+                        lagId = lagId,
+                        faceTemplate = faceTemplate,
+                        faceImage = compressedImage,
+                        thumbnail = thumbnail
+                    )
+
+                    val profileId = AppDatabase.getInstance(getApplication())
+                        .profileDao()
+                        .insert(profileEntity)
+
+                    // Invalidate cache after save
+                    cachedProfiles = null
+
+                    Log.d("CardReaderViewModel", "Profile saved with ID: $profileId")
+
+                    main.post {
+//                        status = "Profile saved successfully!"
+                        onSuccess(profileId)
+                    }
+                } catch (e: Exception) {
+                    Log.e("CardReaderViewModel", "Error saving profile", e)
+                    main.post {
+                        status = "Error saving profile: ${e.message}"
+                        onError(e.message ?: "Unknown error")
+                    }
                 }
             }
         }
@@ -506,7 +523,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     cachedProfiles = null
 
                     main.post {
-                        status = "Profile deleted"
+//                        status = "Profile deleted"
                         onComplete()
                     }
                 } ?: run {
@@ -518,6 +535,79 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             } catch (e: Exception) {
                 Log.e("CardReaderViewModel", "Error deleting profile", e)
                 main.post { onComplete() }
+            }
+        }
+    }
+
+    private fun checkForDuplicates(
+        lagId: String,
+        faceTemplate: ByteArray,
+        onResult: (isDuplicate: Boolean, duplicateType: String?, existingProfile: ProfileEntity?) -> Unit
+    ) {
+        dbExecutor.execute {
+            try {
+                // Check if LAG ID already exists
+                val existingByLagId = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getProfileByLagId(lagId)
+
+                if (existingByLagId != null) {
+                    main.post {
+                        onResult(true, "LAG ID", existingByLagId)
+                    }
+                    return@execute
+                }
+
+                // Check if face matches any existing profile
+                val allProfiles = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getAllProfile()
+
+                if (allProfiles.isEmpty()) {
+                    main.post {
+                        onResult(false, null, null)
+                    }
+                    return@execute
+                }
+
+                // Create subject for the new face
+                val newFaceSubject = NSubject()
+                newFaceSubject.setTemplateBuffer(NBuffer(faceTemplate))
+
+                // Check against each existing profile
+                for (profile in allProfiles) {
+                    try {
+                        val existingSubject = NSubject()
+                        existingSubject.setTemplateBuffer(NBuffer(profile.faceImage))
+
+                        val matchStatus = biometricClient?.verify(newFaceSubject, existingSubject)
+
+                        if (matchStatus == NBiometricStatus.OK) {
+                            val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
+
+                            // High threshold for duplicate detection
+                            val duplicateThreshold = 80
+                            if (score >= duplicateThreshold) {
+                                main.post {
+                                    onResult(true, "Face", profile)
+                                }
+                                return@execute
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
+                    }
+                }
+
+                // No duplicates found
+                main.post {
+                    onResult(false, null, null)
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error checking duplicates", e)
+                main.post {
+                    onResult(false, null, null)
+                }
             }
         }
     }
@@ -646,7 +736,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 // Stop any ongoing capture to avoid conflicts
                 stopCapture()
 
-                main.post { status = "Loading image..." }
+//                main.post { status = "Loading image..." }
 
                 // Read image from URI with options for faster decoding
                 val inputStream = context.contentResolver.openInputStream(uri)
@@ -672,7 +762,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 // Show the image immediately
                 main.post {
                     capturedProfileFace = rotatedBitmap
-                    status = "Detecting face..."
+//                    status = "Detecting face..."
                 }
 
                 // Ensure biometric client is initialized
@@ -741,7 +831,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         onError: (String) -> Unit
     ) {
         try {
-            main.post { status = "Analyzing face..." }
+//            main.post { status = "Analyzing face..." }
             Log.d("CardReaderViewModel", "Starting face detection from image")
 
             // Convert byte array to NImage
@@ -781,7 +871,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     if (template != null && template.isNotEmpty()) {
                         Log.d("CardReaderViewModel", "Template extracted, size: ${template.size}")
                         main.post {
-                            status = "Image uploaded successfully!"
+//                            status = "Image uploaded successfully!"
                             onSuccess(previewBitmap, template)
                         }
                     } else {

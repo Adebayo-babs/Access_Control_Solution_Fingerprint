@@ -51,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -74,9 +75,11 @@ fun AddProfileScreen(
     var capturedFace by remember { mutableStateOf<Bitmap?>(null) }
     var capturedTemplate by remember { mutableStateOf<ByteArray?>(null) }
     var showSuccessDialog by remember { mutableStateOf(false) }
+    var showDuplicateDialog by remember { mutableStateOf(false) }
+    var duplicateMessage by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf("") }
     var isProcessing by remember { mutableStateOf(false) }
-    var isSaving by remember { mutableStateOf(false) } // NEW: Prevent double save
+    var isSaving by remember { mutableStateOf(false) } // Prevent double save
 
     val status by remember { derivedStateOf { viewModel.status } }
 
@@ -164,7 +167,7 @@ fun AddProfileScreen(
                                 bitmap = capturedFace!!.asImageBitmap(),
                                 contentDescription = "Selected Face",
                                 modifier = Modifier.fillMaxSize(),
-                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                contentScale = ContentScale.Crop
                             )
 
                             if (isProcessing) {
@@ -354,7 +357,14 @@ fun AddProfileScreen(
                                     },
                                     onError = { error ->
                                         isSaving = false
-                                        errorMessage = "Error: $error"
+                                        // Check if it's a duplicate error
+                                        if (error.contains("already registered", ignoreCase = true)) {
+                                            duplicateMessage = error
+                                            showDuplicateDialog = true
+                                        } else {
+                                            errorMessage = "Error: $error"
+                                        }
+
                                     }
                                 )
                             } else {
@@ -393,6 +403,48 @@ fun AddProfileScreen(
                 }
             }
         }
+    }
+
+    // Duplicate dialog
+    if (showDuplicateDialog) {
+        AlertDialog(
+            onDismissRequest = { showDuplicateDialog = false },
+            title = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "⚠️",
+                        fontSize = 48.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Duplicate Profile",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFFF9800)
+                    )
+                }
+            },
+             text = {
+                 Text(
+                     text = duplicateMessage,
+                     textAlign = TextAlign.Center,
+                     modifier = Modifier.fillMaxWidth()
+                 )
+             },
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+                         showDuplicateDialog = false
+                         duplicateMessage = ""
+                     }
+                 ) {
+                     Text("OK", color = Color(0xFF00A86B))
+                 }
+             }
+        )
     }
 
     // Success Dialog
