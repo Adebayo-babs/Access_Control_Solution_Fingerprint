@@ -539,6 +539,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+
     private fun checkForDuplicates(
         lagId: String,
         faceTemplate: ByteArray,
@@ -558,7 +559,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     return@execute
                 }
 
-                // Check if face matches any existing profile
+                // Check if face template matches any existing profile
                 val allProfiles = AppDatabase.getInstance(getApplication())
                     .profileDao()
                     .getAllProfile()
@@ -570,7 +571,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     return@execute
                 }
 
-                // Create subject for the new face
+                // Create subject for the new face template
                 val newFaceSubject = NSubject()
                 newFaceSubject.setTemplateBuffer(NBuffer(faceTemplate))
 
@@ -578,16 +579,18 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 for (profile in allProfiles) {
                     try {
                         val existingSubject = NSubject()
-                        existingSubject.setTemplateBuffer(NBuffer(profile.faceImage))
+                        existingSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
 
                         val matchStatus = biometricClient?.verify(newFaceSubject, existingSubject)
 
                         if (matchStatus == NBiometricStatus.OK) {
                             val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
 
-                            // High threshold for duplicate detection
+                            // Use a high threshold for duplicate detection (e.g., 80)
                             val duplicateThreshold = 80
+
                             if (score >= duplicateThreshold) {
+                                Log.d("CardReaderViewModel", "Duplicate face found: ${profile.name}, Score: $score")
                                 main.post {
                                     onResult(true, "Face", profile)
                                 }
@@ -603,6 +606,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 main.post {
                     onResult(false, null, null)
                 }
+
             } catch (e: Exception) {
                 Log.e("CardReaderViewModel", "Error checking duplicates", e)
                 main.post {
