@@ -184,6 +184,22 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    // Initialize client without starting capture
+    fun initializeClientOnly() {
+        if (biometricClient != null) {
+            return // Already initialized
+        }
+
+        executor.execute {
+            try {
+                NeurotecLicenseHelper.obtainFaceLicenses(getApplication())
+                initClient()
+            } catch (e: Exception) {
+                main.post { status = "License Error: ${e.message}"}
+            }
+        }
+    }
+
     fun startAutomaticCapture() {
 
         if (captureInProgress || !isInitialized) {
@@ -380,7 +396,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     else -> "Profile already exists"
                 }
                 main.post {
-                    status = "Duplicate found"
+//                    status = "Duplicate found"
                     onError(errorMsg)
                 }
                 return@checkForDuplicates

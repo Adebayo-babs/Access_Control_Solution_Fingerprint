@@ -41,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -58,6 +59,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.access_control_solution.viewModel.CardReaderViewModel
+import com.example.neurotecsdklibrary.NeurotecLicenseHelper
+import java.util.concurrent.Executors
 
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -68,6 +71,8 @@ fun AddProfileScreen(
     onProfileAdded: () -> Unit
 ) {
     val context = LocalContext.current
+
+    val executor = Executors.newSingleThreadExecutor()
 
     var name by remember { mutableStateOf("") }
     var lagId by remember { mutableStateOf("") }
@@ -82,6 +87,25 @@ fun AddProfileScreen(
     var isSaving by remember { mutableStateOf(false) } // Prevent double save
 
     val status by remember { derivedStateOf { viewModel.status } }
+
+    // Clean up when screen is first loaded
+    LaunchedEffect(Unit) {
+        viewModel.clearCapturedStaffFace()
+        viewModel.stopCapture()
+        viewModel.hideDialog()
+        // Verify biometric client is initialized
+        if (viewModel.biometricClient == null) {
+            viewModel.initialize()
+        }
+    }
+
+    // Clean up when leaving screen
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.stopCapture()
+            viewModel.clearCapturedStaffFace()
+        }
+    }
 
     // Image picker launcher
     val imagePickerLauncher = rememberLauncherForActivityResult(
@@ -114,9 +138,13 @@ fun AddProfileScreen(
         }
     }
 
-    // Initialize Neurotec when screen loads
     LaunchedEffect(Unit) {
-        viewModel.initialize()
+        viewModel.clearCapturedStaffFace()
+        viewModel.stopCapture()
+        viewModel.hideDialog()
+        // Initialize client only
+        viewModel.initializeClientOnly()
+
     }
 
     Scaffold(
