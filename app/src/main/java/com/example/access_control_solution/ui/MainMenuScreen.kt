@@ -11,16 +11,20 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -33,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.example.access_control_solution.viewModel.CardReaderViewModel
+import kotlinx.coroutines.delay
 
 
 @Composable
@@ -44,7 +49,6 @@ fun MainMenuScreen(
 ) {
 
     val dialogState by viewModel.dialogState.collectAsState()
-
 
     Box(
         modifier = Modifier.fillMaxSize()
@@ -71,7 +75,7 @@ fun MainMenuScreen(
                     color = Color.Black
                 )
 
-                // Profile/Settings Button
+                // Profile Button
                 Card(
                     onClick = onNavigateToProfileList,
                     shape = CircleShape,
@@ -93,6 +97,49 @@ fun MainMenuScreen(
             }
 
             Spacer(modifier = Modifier.height(40.dp))
+
+            // Server Status Card
+//            Card(
+//                modifier = Modifier.fillMaxWidth(),
+//                colors = CardDefaults.cardColors(
+//                    containerColor = if (viewModel.isServerAvailable)
+//                        Color(0xFFE8F5E9) else Color(0xFFFFEBEE)
+//                ),
+//                shape = RoundedCornerShape(12.dp),
+//                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+//            ) {
+//                Row(
+//                    modifier = Modifier
+//                        .fillMaxWidth()
+//                        .padding(16.dp),
+//                    verticalAlignment = Alignment.CenterVertically
+//                ) {
+//                    Text(
+//                        text = if (viewModel.isServerAvailable) "🟢" else "🔴",
+//                        fontSize = 24.sp
+//                    )
+//                    Spacer(modifier = Modifier.width(12.dp))
+//                    Column {
+//                        Text(
+//                            text = if (viewModel.isServerAvailable)
+//                                "Server Online" else "Offline Mode",
+//                            fontWeight = FontWeight.Bold,
+//                            fontSize = 16.sp,
+//                            color = Color.Black
+//                        )
+//                        Text(
+//                            text = if (viewModel.isServerAvailable)
+//                                "Profiles synced across all devices"
+//                            else
+//                                "Using local profiles only",
+//                            fontSize = 12.sp,
+//                            color = Color.Gray
+//                        )
+//                    }
+//                }
+//            }
+//
+//            Spacer(modifier = Modifier.height(32.dp))
 
             // Tap Card Button
             Card(
@@ -129,85 +176,85 @@ fun MainMenuScreen(
                     Spacer(modifier = Modifier.height(20.dp))
 
                     Text(
-                        text = "Tap your card or click the button below to verify your face",
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        text = "Tap your card",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
                         color = Color.White
                     )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Tap your card on the device to verify your identity",
+                        fontSize = 14.sp,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
                 }
-
-                Spacer(modifier = Modifier.height(20.dp))
-
-                // Manual Verify Button
-                Card(
-                    onClick = onNavigateToFaceCapture,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFF2196F3)
-                    ),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(20.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "📷",
-                            fontSize = 24.sp,
-                            modifier = Modifier.padding(end = 12.dp)
-                        )
-                        Text(
-                            text = "Verify Face Now",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(20.dp))
             }
 
-            // Dialog overlay
-            if (dialogState.showDialog) {
-                Dialog(onDismissRequest = {}) {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer
-                        ),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(32.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Success",
-                                modifier = Modifier.size(64.dp),
-                                tint = MaterialTheme.colorScheme.primary
-                            )
+            Spacer(modifier = Modifier.height(24.dp))
 
-                            Text(
-                                text = dialogState.message,
-                                fontSize = 24.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(top = 16.dp)
-                            )
-                        }
+            // "OR" Divider
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(1.dp)
+                        .background(Color.LightGray)
+                )
+                Text(
+                    text = "OR",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Gray,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(1.dp)
+                        .background(Color.LightGray)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Verify Face Button
+            Button(
+                onClick = onNavigateToFaceCapture,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(70.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF2196F3)
+                ),
+                elevation = ButtonDefaults.buttonElevation(
+                    defaultElevation = 4.dp,
+                    pressedElevation = 8.dp
+                )
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📷",
+                        fontSize = 28.sp
+                    )
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = "Verify Face",
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
                     }
                 }
             }

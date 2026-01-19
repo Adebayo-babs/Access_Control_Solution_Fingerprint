@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -43,6 +44,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -72,8 +74,6 @@ fun AddProfileScreen(
 ) {
     val context = LocalContext.current
 
-    val executor = Executors.newSingleThreadExecutor()
-
     var name by remember { mutableStateOf("") }
     var lagId by remember { mutableStateOf("") }
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
@@ -86,13 +86,35 @@ fun AddProfileScreen(
     var isProcessing by remember { mutableStateOf(false) }
     var isSaving by remember { mutableStateOf(false) } // Prevent double save
 
+    val cardData by viewModel.cardData.collectAsState()
+    val cardReadError by viewModel.cardReadError.collectAsState()
+
     val status by remember { derivedStateOf { viewModel.status } }
+
+    // Update fields when card is tapped
+    LaunchedEffect(cardData) {
+        cardData?.let { (fullName, lagIdFromCard) ->
+            name = fullName
+            lagId = lagIdFromCard
+            // Clear card data after using it
+            viewModel.clearCardData()
+        }
+    }
+
+    // Show error if card read fails
+    LaunchedEffect(cardReadError) {
+        cardReadError?.let { error ->
+            errorMessage = error
+            viewModel.clearCardData()
+        }
+    }
 
     // Clean up when screen is first loaded
     LaunchedEffect(Unit) {
         viewModel.clearCapturedStaffFace()
         viewModel.stopCapture()
         viewModel.hideDialog()
+        viewModel.clearCardData() // Clear any previous card data
         // Verify biometric client is initialized
         if (viewModel.biometricClient == null) {
             viewModel.initialize()
@@ -104,6 +126,7 @@ fun AddProfileScreen(
         onDispose {
             viewModel.stopCapture()
             viewModel.clearCapturedStaffFace()
+            viewModel.clearCardData()
         }
     }
 
@@ -292,6 +315,37 @@ fun AddProfileScreen(
             }
 
             Spacer(modifier = Modifier.height(24.dp))
+
+            // NFC Card Instructions
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color(0xFFE3F2FD)
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "))))",
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF2196F3)
+                    )
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Text(
+                        text = "Insert the image then tap your card to auto-fill details\nor enter manually below",
+                        fontSize = 14.sp,
+                        color = Color(0xFF1976D2)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
 
             // Staff Details Form
             OutlinedTextField(

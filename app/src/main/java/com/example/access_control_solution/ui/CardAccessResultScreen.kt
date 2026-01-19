@@ -22,6 +22,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -31,6 +32,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.access_control_solution.data.ProfileEntity
+import kotlinx.coroutines.delay
 
 
 @Composable
@@ -40,6 +42,11 @@ fun CardAccessResultScreen(
     message: String,
     onBack: () -> Unit
 ) {
+
+    LaunchedEffect(Unit) {
+        delay(2000)
+        onBack()
+    }
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = if (accessGranted) Color(0xFFE8F5E9) else Color(0xFFFFEBEE)
@@ -126,32 +133,12 @@ fun CardAccessResultScreen(
                     }
                 }
             } else {
-                // Message for denied access
                 Text(
                     text = message,
                     fontSize = 18.sp,
                     color = Color(0xFF666666),
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 24.dp)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(48.dp))
-
-            // Back Button
-            Button(
-                onClick = onBack,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (accessGranted) Color(0xFF4CAF50) else Color(0xFFE53935)
-                )
-            ) {
-                Text(
-                    text = "Back to Main Menu",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
                 )
             }
         }

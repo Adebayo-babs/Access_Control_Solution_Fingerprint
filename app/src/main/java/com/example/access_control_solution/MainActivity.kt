@@ -83,6 +83,9 @@ class MainActivity : ComponentActivity() {
     private var cardAccessGranted by mutableStateOf(false)
     private var cardAccessMessage by mutableStateOf("")
 
+    // Flag to track which screen is active for NFC handling
+    private var isAddProfileScreenActive by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -116,6 +119,7 @@ class MainActivity : ComponentActivity() {
                                     currentScreen = Screen.FACE_CAPTURE
                                 },
                                 onNavigateToAddProfile = {
+                                    isAddProfileScreenActive = true
                                     currentScreen = Screen.ADD_PROFILE
                                 },
                                 onNavigateToProfileList = {
@@ -149,8 +153,16 @@ class MainActivity : ComponentActivity() {
                         Screen.ADD_PROFILE -> {
                             AddProfileScreen(
                                 viewModel = viewModel,
-                                onBack = { currentScreen = Screen.MAIN_MENU },
-                                onProfileAdded = { currentScreen = Screen.PROFILE_LIST }
+                                onBack = {
+                                    isAddProfileScreenActive = false
+                                    currentScreen = Screen.MAIN_MENU
+                                         },
+                                onProfileAdded = {
+                                    isAddProfileScreenActive = false
+                                    // Invalidate cache before navigating
+                                    viewModel.invalidateCache()
+                                    currentScreen = Screen.PROFILE_LIST
+                                }
                             )
                         }
 
@@ -158,7 +170,10 @@ class MainActivity : ComponentActivity() {
                             ProfileListScreen(
                                 viewModel = viewModel,
                                 onBack = { currentScreen = Screen.MAIN_MENU },
-                                onAddProfile = { currentScreen = Screen.ADD_PROFILE }
+                                onAddProfile = {
+                                    isAddProfileScreenActive = true
+                                    currentScreen = Screen.ADD_PROFILE
+                                }
                             )
                         }
 
@@ -261,47 +276,77 @@ class MainActivity : ComponentActivity() {
                         cardReader.readCardDataAsync(isoDep)
                     }
 
-                    val lagId = cardData.cardId ?: cardData.holderName
-
-                    if (lagId != null) {
-                        Log.d(TAG, "LAG ID read: $lagId")
-
-                        // Check if LAG ID exists in database
-                        viewModel.checkLagIdInDatabase(lagId) { profile, exists ->
-                            if (exists && profile != null) {
-                                // Access granted
-                                cardAccessProfile = profile
-                                cardAccessGranted = true
-                                cardAccessMessage = "Welcome, ${profile.name}"
-                                currentScreen = Screen.ACCESS_RESULT
-                            } else {
-                                // Access denied
-                                cardAccessProfile = null
-                                cardAccessGranted = false
-                                cardAccessMessage = "LAG ID not registered: $lagId"
-                                currentScreen = Screen.ACCESS_RESULT
-                            }
-                        }
+                    // Check which screen is active
+                    if (isAddProfileScreenActive) {
+                        // Send card data to AddProfileScreen via ViewModel
+                        handleCardDataForAddProfile(cardData)
                     } else {
-                        Log.e(TAG, "Failed to read LAG ID from card")
-                        cardAccessProfile = null
-                        cardAccessGranted = false
-                        cardAccessMessage = "Could not read card data"
-                        currentScreen = Screen.ACCESS_RESULT
+                        // Handle card data for access control
+                        handleCardDataForAccess(cardData)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error reading card", e)
-                    cardAccessProfile = null
-                    cardAccessGranted = false
-                    cardAccessMessage = "Error reading card: ${e.message}"
-                    currentScreen = Screen.ACCESS_RESULT
+                    if (isAddProfileScreenActive) {
+                        viewModel.setCardReadError("Error reading card: ${e.message}")
+                    } else {
+                        cardAccessProfile = null
+                        cardAccessGranted = false
+                        cardAccessMessage = "Error reading card: ${e.message}"
+                        currentScreen = Screen.ACCESS_RESULT
+                    }
                 }
             }
         } else {
             Log.e(TAG, "Card is not ISO-DEP compatible")
+            if (isAddProfileScreenActive) {
+                viewModel.setCardReadError("Card not supported")
+            } else {
+                cardAccessProfile = null
+                cardAccessGranted = false
+                cardAccessMessage = "Card not supported"
+                currentScreen = Screen.ACCESS_RESULT
+            }
+        }
+    }
+
+    private fun handleCardDataForAddProfile(cardData: OptimizedCardDataReader.CardData) {
+        val fullName = cardData.holderName ?: ""
+        val lagId = cardData.cardId ?: ""
+
+        if (fullName.isNotEmpty() && lagId.isNotEmpty()) {
+            viewModel.setCardDataForProfile(fullName, lagId)
+        } else {
+            viewModel.setCardReadError("Could not read complete card data")
+        }
+    }
+
+    private fun handleCardDataForAccess(cardData: OptimizedCardDataReader.CardData) {
+        val lagId = cardData.cardId ?: cardData.holderName
+
+        if (lagId != null) {
+            Log.d(TAG, "LAG ID read: $lagId")
+
+            // Check if LAG ID exists in database
+            viewModel.checkLagIdInDatabase(lagId) { profile, exists ->
+                if (exists && profile != null) {
+                    // Access granted
+                    cardAccessProfile = profile
+                    cardAccessGranted = true
+                    cardAccessMessage = "Welcome, ${profile.name}"
+                    currentScreen = Screen.ACCESS_RESULT
+                } else {
+                    // Access denied
+                    cardAccessProfile = null
+                    cardAccessGranted = false
+                    cardAccessMessage = "LAG ID not registered: $lagId"
+                    currentScreen = Screen.ACCESS_RESULT
+                }
+            }
+        } else {
+            Log.e(TAG, "Failed to read LAG ID from card")
             cardAccessProfile = null
             cardAccessGranted = false
-            cardAccessMessage = "Card not supported"
+            cardAccessMessage = "Could not read card data"
             currentScreen = Screen.ACCESS_RESULT
         }
     }

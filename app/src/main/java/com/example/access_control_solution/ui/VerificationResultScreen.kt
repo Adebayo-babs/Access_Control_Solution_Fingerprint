@@ -23,6 +23,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.access_control_solution.data.ProfileEntity
 import com.example.access_control_solution.viewModel.CardReaderViewModel
+import kotlinx.coroutines.delay
 
 
 @Composable
@@ -44,6 +46,11 @@ fun VerificationResultScreen(
     matchScore: Int,
     onBack: () -> Unit
 ) {
+
+    LaunchedEffect(Unit) {
+        delay(2000)
+        onBack()
+    }
 
     val isMatch = matchScore >= 70
     val backgroundColor = if (isMatch) Color(0xFF00A86B) else Color(0xFFFF5722)
@@ -164,27 +171,6 @@ fun VerificationResultScreen(
                     textAlign = TextAlign.Center
                 )
             }
-        }
-
-        Spacer(modifier = Modifier.height(32.dp))
-
-        // Back Button
-        Button(
-            onClick = onBack,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color.White
-            ),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Text(
-                text = "Back to Home",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = backgroundColor
-            )
         }
     }
 

@@ -13,7 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
-import androidx.room.concurrent.AtomicBoolean
+import com.example.access_control_solution.api_models.ProfileSyncManager
 import com.example.access_control_solution.data.AppDatabase
 import com.example.access_control_solution.data.ProfileEntity
 import com.example.neurotecsdklibrary.NeurotecLicenseHelper
@@ -27,13 +27,16 @@ import com.neurotec.devices.NCamera
 import com.neurotec.devices.NDeviceType
 import com.neurotec.images.NImage
 import com.neurotec.io.NBuffer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.lang.Error
 import java.util.EnumSet
-import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
 data class FaceDetectionFeedback(
@@ -98,6 +101,13 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     // Callback property for sound
     var onFaceDetectedSound: (() -> Unit)? = null
 
+    // Card data state for AddProfileScreen
+    private val _cardData = MutableStateFlow<Pair<String, String>?>(null)
+    val cardData: StateFlow<Pair<String, String>?> = _cardData.asStateFlow()
+
+    private val _cardReadError = MutableStateFlow<String?>(null)
+    val cardReadError: StateFlow<String?> = _cardReadError.asStateFlow()
+
     private val cameras = mutableListOf<NCamera>()
     private var activeCameraIndex = 0
 
@@ -115,6 +125,10 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     private var cachedProfiles: List<ProfileEntity>? = null
     private var cacheTimestamp: Long = 0
     private val CACHE_DURATION_MS = 30000L  // 30 seconds cache
+
+    private lateinit var syncManager: ProfileSyncManager
+    var isServerAvailable by mutableStateOf(false)
+    private var isSyncing by mutableStateOf(false)
 
     fun initialize() {
         if (isInitialized) {
@@ -194,10 +208,77 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             try {
                 NeurotecLicenseHelper.obtainFaceLicenses(getApplication())
                 initClient()
+                isInitialized = true
             } catch (e: Exception) {
                 main.post { status = "License Error: ${e.message}"}
             }
         }
+    }
+
+    fun initializeSyncManager() {
+        syncManager = ProfileSyncManager(getApplication())
+        // Check server availability on startup
+        executor.execute {
+            CoroutineScope(Dispatchers.IO).launch {
+                isServerAvailable = syncManager.isServerAvailable()
+
+                if (isServerAvailable) {
+                    // Automatically load profiles from server on startup
+                    loadProfilesFromServer()
+                } else {
+                    Log.w("CardReaderViewModel", "Server not available, using local database only")
+                }
+            }
+        }
+
+    }
+
+    private fun loadProfilesFromServer() {
+        if (isSyncing) {
+            return
+        }
+
+        isSyncing = true
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val result = syncManager.loadAllProfilesFromServer()
+
+                main.post {
+                    isSyncing = false
+                    if (result.isSuccess) {
+                        val count = result.getOrDefault(0)
+                        Log.d("CardReaderViewModel", "Successfully loaded $count profiles")
+
+                        // Invalidate cache
+                        cachedProfiles = null
+                    } else {
+                        Log.e("CardReaderViewModel", "Failed to load profiles: ${result.exceptionOrNull()}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error loading profiles", e)
+                main.post {
+                    isSyncing = false
+                }
+            }
+        }
+    }
+
+    fun setCardDataForProfile(fullName: String, lagId: String) {
+        main.post {
+            _cardData.value = Pair(fullName, lagId)
+            _cardReadError.value = null
+        }
+    }
+
+    fun setCardReadError(error: String) {
+        _cardReadError.value = error
+    }
+
+    fun clearCardData() {
+        _cardData.value = null
+        _cardReadError.value = null
     }
 
     fun startAutomaticCapture() {
@@ -379,6 +460,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         isInitialized = false
     }
 
+    // Save profile function with server sync
     fun saveProfile(
         name: String,
         lagId: String,
@@ -387,61 +469,181 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         onSuccess: (Long) -> Unit,
         onError: (String) -> Unit
     ) {
-        // First check for duplicates
-        checkForDuplicates(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
-            if (isDuplicate) {
-                val errorMsg = when (duplicateType) {
-                    "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
-                    "Face" -> "This face is already registered as ${existingProfile?.name}"
-                    else -> "Profile already exists"
+        dbExecutor.execute {
+            try {
+                val compressedImage = compressFaceImage(faceImage)
+                val thumbnail = createThumbnail(faceImage)
+
+                val profileEntity = ProfileEntity(
+                    name = name,
+                    lagId = lagId,
+                    faceTemplate = faceTemplate,
+                    faceImage = compressedImage,
+                    thumbnail = thumbnail
+                )
+
+                // Try to save to server first (includes duplicate checking)
+                CoroutineScope(Dispatchers.IO).launch {
+                    if (isServerAvailable) {
+                        val serverResult = syncManager.saveProfileToServer(profileEntity)
+
+                        if (serverResult.isSuccess) {
+                            // Server save successful, now save locally
+                            try {
+                                val profileId = AppDatabase.getInstance(getApplication())
+                                    .profileDao()
+                                    .insert(profileEntity)
+
+                                cachedProfiles = null
+                                cacheTimestamp = 0
+
+                                Log.d("CardReaderViewModel", "✓ Profile saved: local ID=$profileId, server ID=${serverResult.getOrNull()}")
+                                main.post { onSuccess(profileId) }
+                            } catch (e: Exception) {
+                                Log.e("CardReaderViewModel", "Error saving to local DB", e)
+                                main.post { onError("Saved to server but failed to save locally: ${e.message}") }
+                            }
+                        } else {
+                            // Server save failed - get the actual error message
+                            val error = serverResult.exceptionOrNull()?.message ?: "Failed to save profile"
+                            Log.e("CardReaderViewModel", "Server error: $error")
+
+                            // Show the error to user
+                            main.post { onError(error) }
+                        }
+                    } else {
+                        // Server not available, save locally only with local duplicate check
+                        Log.w("CardReaderViewModel", "Server unavailable, performing local duplicate check...")
+
+                        checkForDuplicatesLocally(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
+                            if (isDuplicate) {
+                                val errorMsg = when (duplicateType) {
+                                    "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
+                                    "Face" -> "This face is already registered as ${existingProfile?.name}"
+                                    else -> "Profile already exists"
+                                }
+                                Log.w("CardReaderViewModel", "Local duplicate found: $errorMsg")
+                                main.post { onError(errorMsg) }
+                            } else {
+                                try {
+                                    val profileId = AppDatabase.getInstance(getApplication())
+                                        .profileDao()
+                                        .insert(profileEntity)
+
+                                    cachedProfiles = null
+                                    cacheTimestamp = 0
+
+                                    Log.d("CardReaderViewModel", "✓ Profile saved locally: ID=$profileId")
+                                    main.post { onSuccess(profileId) }
+                                } catch (e: Exception) {
+                                    Log.e("CardReaderViewModel", "Error saving locally", e)
+                                    main.post { onError(e.message ?: "Unknown error") }
+                                }
+                            }
+                        }
+                    }
                 }
-                main.post {
-//                    status = "Duplicate found"
-                    onError(errorMsg)
-                }
-                return@checkForDuplicates
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error in saveProfile", e)
+                main.post { onError(e.message ?: "Unknown error") }
             }
+        }
+    }
 
-            // No duplicates, proceed with saving
-            dbExecutor.execute {
-                try {
-                    Log.d("CardReaderViewModel", "Saving profile: $name, LAG ID: $lagId")
-//                    main.post { status = "Saving profile..." }
+    private fun checkForDuplicatesLocally(
+        lagId: String,
+        faceTemplate: ByteArray,
+        onResult: (isDuplicate: Boolean, duplicateType: String?, existingProfile: ProfileEntity?) -> Unit
+    ) {
+        dbExecutor.execute {
+            try {
+                // Check if LAG ID already exists locally
+                val existingByLagId = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getProfileByLagId(lagId)
 
-                    val compressedImage = compressFaceImage(faceImage)
-                    val thumbnail = createThumbnail(faceImage)
-
-                    val profileEntity = ProfileEntity(
-                        name = name,
-                        lagId = lagId,
-                        faceTemplate = faceTemplate,
-                        faceImage = compressedImage,
-                        thumbnail = thumbnail
-                    )
-
-                    val profileId = AppDatabase.getInstance(getApplication())
-                        .profileDao()
-                        .insert(profileEntity)
-
-                    // Invalidate cache after save
-                    cachedProfiles = null
-
-                    Log.d("CardReaderViewModel", "Profile saved with ID: $profileId")
-
+                if (existingByLagId != null) {
+                    Log.d("CardReaderViewModel", "Duplicate LAG ID found: ${existingByLagId.name}")
                     main.post {
-//                        status = "Profile saved successfully!"
-                        onSuccess(profileId)
+                        onResult(true, "LAG ID", existingByLagId)
                     }
-                } catch (e: Exception) {
-                    Log.e("CardReaderViewModel", "Error saving profile", e)
+                    return@execute
+                }
+
+                // Check face template against local profiles
+                val allProfiles = AppDatabase.getInstance(getApplication())
+                    .profileDao()
+                    .getAllProfile()
+
+                if (allProfiles.isEmpty()) {
+                    Log.d("CardReaderViewModel", "No profiles in database, no duplicates")
                     main.post {
-                        status = "Error saving profile: ${e.message}"
-                        onError(e.message ?: "Unknown error")
+                        onResult(false, null, null)
                     }
+                    return@execute
+                }
+
+                // Create subject for the new face template
+                val newFaceSubject = NSubject()
+                newFaceSubject.setTemplateBuffer(NBuffer(faceTemplate))
+
+                var bestMatchScore = 0
+                var bestMatchProfile: ProfileEntity? = null
+
+                // Check against each existing profile
+                for (profile in allProfiles) {
+                    try {
+                        val existingSubject = NSubject()
+                        existingSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
+
+                        val matchStatus = biometricClient?.verify(newFaceSubject, existingSubject)
+
+                        if (matchStatus == NBiometricStatus.OK) {
+                            val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
+
+                            Log.d("CardReaderViewModel", "Match score with ${profile.name}: $score")
+
+                            if (score > bestMatchScore) {
+                                bestMatchScore = score
+                                bestMatchProfile = profile
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
+                    }
+                }
+
+                // INCREASED THRESHOLD to reduce false positives
+                // Face must match with score >= 90 to be considered duplicate
+                val duplicateThreshold = 90
+
+                if (bestMatchScore >= duplicateThreshold && bestMatchProfile != null) {
+                    Log.d("CardReaderViewModel", "Duplicate face found: ${bestMatchProfile.name}, Score: $bestMatchScore")
+                    main.post {
+                        onResult(true, "Face", bestMatchProfile)
+                    }
+                } else {
+                    if (bestMatchScore > 0) {
+                        Log.d("CardReaderViewModel", "No duplicate (Best match: ${bestMatchProfile?.name}, Score: $bestMatchScore)")
+                    } else {
+                        Log.d("CardReaderViewModel", "No matches found")
+                    }
+                    main.post {
+                        onResult(false, null, null)
+                    }
+                }
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error checking duplicates locally", e)
+                main.post {
+                    onResult(false, null, null)
                 }
             }
         }
     }
+
+
 
     private fun createThumbnail(imageBytes: ByteArray): ByteArray {
         return try {
@@ -494,18 +696,56 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+
     fun getAllProfile(callback: (List<ProfileEntity>) -> Unit, forceRefresh: Boolean = false) {
+        // If force refresh requested, clear cache first
+        if (forceRefresh) {
+            cachedProfiles = null
+            cacheTimestamp = 0
+        }
+
+        // If force refresh and server available, reload from server
+        if (forceRefresh && isServerAvailable && !isSyncing) {
+            isSyncing = true
+
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    // Reload from server
+                    val result = syncManager.loadAllProfilesFromServer()
+
+                    main.post {
+                        isSyncing = false
+
+                        // After server sync, get local profiles
+                        getLocalProfiles(callback)
+                    }
+                } catch (e: Exception) {
+                    Log.e("CardReaderViewModel", "Error syncing", e)
+                    main.post {
+                        isSyncing = false
+                        // Even if sync fails, return local data
+                        getLocalProfiles(callback)
+                    }
+                }
+            }
+            return
+        }
 
         // Return cached data if still fresh
         if (!forceRefresh && cachedProfiles != null &&
-                (System.currentTimeMillis() - cacheTimestamp) < CACHE_DURATION_MS) {
+            (System.currentTimeMillis() - cacheTimestamp) < CACHE_DURATION_MS) {
             Log.d("CardReaderViewModel", "Returning cached profiles")
-            main.post { callback(cachedProfiles!!)}
+            main.post { callback(cachedProfiles!!) }
             return
         }
+
+        // Otherwise get from local database
+        getLocalProfiles(callback)
+    }
+
+    private fun getLocalProfiles(callback: (List<ProfileEntity>) -> Unit) {
         dbExecutor.execute {
             try {
-                // Load essential data
                 val profileList = AppDatabase.getInstance(getApplication())
                     .profileDao()
                     .getAllProfile()
@@ -531,17 +771,26 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     .getProfileById(profileId)
 
                 profile?.let { profileToDelete ->
+                    // Delete from local database
                     AppDatabase.getInstance(getApplication())
                         .profileDao()
                         .delete(profileToDelete)
 
-                    // Invalidate cache after delete
                     cachedProfiles = null
 
-                    main.post {
-//                        status = "Profile deleted"
-                        onComplete()
+                    // Delete from server
+                    if (isServerAvailable) {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val result = syncManager.deleteProfileFromServer(profileToDelete.lagId)
+                            if (result.isSuccess) {
+                                Log.d("CardReaderViewModel", "Profile deleted from server")
+                            } else {
+                                Log.w("CardReaderViewModel", "Failed to delete from server: ${result.exceptionOrNull()}")
+                            }
+                        }
                     }
+
+                    main.post { onComplete() }
                 } ?: run {
                     main.post {
                         status = "Profile not found"
@@ -554,6 +803,48 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             }
         }
     }
+
+    fun refreshFromServer(onComplete: (Int, String?) -> Unit) {
+        if (!isServerAvailable) {
+            main.post { onComplete(0, "Server not available") }
+            return
+        }
+
+        if (isSyncing) {
+            main.post { onComplete(0, "Sync already in progress") }
+            return
+        }
+
+        isSyncing = true
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val result = syncManager.loadAllProfilesFromServer()
+
+                main.post {
+                    isSyncing = false
+                    cachedProfiles = null
+
+                    if (result.isSuccess) {
+                        val count = result.getOrDefault(0)
+                        onComplete(count, null)
+                    } else {
+                        onComplete(0, result.exceptionOrNull()?.message ?: "Unknown error")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Error refreshing", e)
+                main.post {
+                    isSyncing = false
+                    onComplete(0, e.message)
+                }
+            }
+        }
+    }
+    init {
+        initializeSyncManager()
+    }
+
 
 
     private fun checkForDuplicates(
@@ -851,7 +1142,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         onError: (String) -> Unit
     ) {
         try {
-//            main.post { status = "Analyzing face..." }
             Log.d("CardReaderViewModel", "Starting face detection from image")
 
             // Convert byte array to NImage
@@ -863,8 +1153,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             val face = NFace()
             face.image = nImage
             subject.faces.add(face)
-
-//            main.post { status = "Extracting template..." }
 
             // Create task
             val task = biometricClient?.createTask(
@@ -972,10 +1260,19 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun invalidateCache() {
+        cachedProfiles = null
+        cacheTimestamp = 0
+    }
+
 
     fun clearCapturedStaffFace() {
         capturedProfileFace = null
         capturedProfileTemplate = null
+    }
+
+    fun dismissDialog() {
+        _dialogState.value = DialogState(showDialog = false, message = "")
     }
 
     override fun onCleared() {
