@@ -460,7 +460,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         isInitialized = false
     }
 
-    // Save profile function with server sync
     fun saveProfile(
         name: String,
         lagId: String,
@@ -482,49 +481,32 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                     thumbnail = thumbnail
                 )
 
-                // Try to save to server first (includes duplicate checking)
-                CoroutineScope(Dispatchers.IO).launch {
-                    if (isServerAvailable) {
-                        val serverResult = syncManager.saveProfileToServer(profileEntity)
-
-                        if (serverResult.isSuccess) {
-                            // Server save successful, now save locally
-                            try {
-                                val profileId = AppDatabase.getInstance(getApplication())
-                                    .profileDao()
-                                    .insert(profileEntity)
-
-                                cachedProfiles = null
-                                cacheTimestamp = 0
-
-                                Log.d("CardReaderViewModel", "✓ Profile saved: local ID=$profileId, server ID=${serverResult.getOrNull()}")
-                                main.post { onSuccess(profileId) }
-                            } catch (e: Exception) {
-                                Log.e("CardReaderViewModel", "Error saving to local DB", e)
-                                main.post { onError("Saved to server but failed to save locally: ${e.message}") }
-                            }
-                        } else {
-                            // Server save failed - get the actual error message
-                            val error = serverResult.exceptionOrNull()?.message ?: "Failed to save profile"
-                            Log.e("CardReaderViewModel", "Server error: $error")
-
-                            // Show the error to user
-                            main.post { onError(error) }
+                // Check for duplicates
+                checkForDuplicatesLocally(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
+                    if (isDuplicate) {
+                        val errorMsg = when (duplicateType) {
+                            "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
+                            "Face" -> "This face is already registered as ${existingProfile?.name}"
+                            else -> "Profile already exists"
                         }
-                    } else {
-                        // Server not available, save locally only with local duplicate check
-                        Log.w("CardReaderViewModel", "Server unavailable, performing local duplicate check...")
+                        Log.w("CardReaderViewModel", "✗ Local duplicate found: $errorMsg")
+                        main.post { onError(errorMsg) }
+                        return@checkForDuplicatesLocally
+                    }
 
-                        checkForDuplicatesLocally(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
-                            if (isDuplicate) {
-                                val errorMsg = when (duplicateType) {
-                                    "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
-                                    "Face" -> "This face is already registered as ${existingProfile?.name}"
-                                    else -> "Profile already exists"
-                                }
-                                Log.w("CardReaderViewModel", "Local duplicate found: $errorMsg")
-                                main.post { onError(errorMsg) }
-                            } else {
+                    Log.d("CardReaderViewModel", "✓ No local duplicates found")
+
+                    // If server is available, try to save to server
+                    if (isServerAvailable) {
+                        Log.d("CardReaderViewModel", "Step 2: Saving to server...")
+
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val serverResult = syncManager.saveProfileToServer(profileEntity)
+
+                            if (serverResult.isSuccess) {
+                                Log.d("CardReaderViewModel", "✓ Server save successful")
+
+                                // Save locally after server confirms no duplicates
                                 try {
                                     val profileId = AppDatabase.getInstance(getApplication())
                                         .profileDao()
@@ -533,19 +515,41 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                                     cachedProfiles = null
                                     cacheTimestamp = 0
 
-                                    Log.d("CardReaderViewModel", "✓ Profile saved locally: ID=$profileId")
                                     main.post { onSuccess(profileId) }
                                 } catch (e: Exception) {
-                                    Log.e("CardReaderViewModel", "Error saving locally", e)
-                                    main.post { onError(e.message ?: "Unknown error") }
+                                    main.post { onError("Saved to server but failed to save locally: ${e.message}") }
                                 }
+                            } else {
+                                // Server returned error (likely LAG ID duplicate from another device)
+                                val error = serverResult.exceptionOrNull()?.message ?: "Failed to save profile"
+                                Log.e("CardReaderViewModel", "✗ Server rejected: $error")
+                                main.post { onError(error) }
                             }
+                        }
+                    } else {
+                        // Save locally only
+                        Log.d("CardReaderViewModel", "Step 2: Server offline, saving locally only...")
+
+                        try {
+                            val profileId = AppDatabase.getInstance(getApplication())
+                                .profileDao()
+                                .insert(profileEntity)
+
+                            cachedProfiles = null
+                            cacheTimestamp = 0
+
+                            Log.d("CardReaderViewModel", "✓ Offline save successful: ID=$profileId")
+                            Log.d("CardReaderViewModel", "=== SAVE COMPLETE (OFFLINE) ===")
+                            main.post { onSuccess(profileId) }
+                        } catch (e: Exception) {
+                            Log.e("CardReaderViewModel", "✗ Local save failed", e)
+                            main.post { onError(e.message ?: "Unknown error") }
                         }
                     }
                 }
 
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error in saveProfile", e)
+                Log.e("CardReaderViewModel", "✗ Error in saveProfile", e)
                 main.post { onError(e.message ?: "Unknown error") }
             }
         }
@@ -558,31 +562,38 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     ) {
         dbExecutor.execute {
             try {
-                // Check if LAG ID already exists locally
+                Log.d("CardReaderViewModel", "--- Duplicate Check Started ---")
+
+                // CHECK LAG ID duplicate
+                Log.d("CardReaderViewModel", "Checking LAG ID: $lagId")
                 val existingByLagId = AppDatabase.getInstance(getApplication())
                     .profileDao()
                     .getProfileByLagId(lagId)
 
                 if (existingByLagId != null) {
-                    Log.d("CardReaderViewModel", "Duplicate LAG ID found: ${existingByLagId.name}")
+                    Log.d("CardReaderViewModel", "✗ DUPLICATE LAG ID: ${existingByLagId.name}")
                     main.post {
                         onResult(true, "LAG ID", existingByLagId)
                     }
                     return@execute
                 }
+                Log.d("CardReaderViewModel", "✓ LAG ID is unique")
 
-                // Check face template against local profiles
+                // Face template duplicate
+                Log.d("CardReaderViewModel", "Checking face template...")
                 val allProfiles = AppDatabase.getInstance(getApplication())
                     .profileDao()
                     .getAllProfile()
 
                 if (allProfiles.isEmpty()) {
-                    Log.d("CardReaderViewModel", "No profiles in database, no duplicates")
+                    Log.d("CardReaderViewModel", "✓ Database is empty, no face duplicates possible")
                     main.post {
                         onResult(false, null, null)
                     }
                     return@execute
                 }
+
+                Log.d("CardReaderViewModel", "Comparing against ${allProfiles.size} existing profiles")
 
                 // Create subject for the new face template
                 val newFaceSubject = NSubject()
@@ -592,7 +603,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 var bestMatchProfile: ProfileEntity? = null
 
                 // Check against each existing profile
-                for (profile in allProfiles) {
+                allProfiles.forEachIndexed { index, profile ->
                     try {
                         val existingSubject = NSubject()
                         existingSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
@@ -602,40 +613,38 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                         if (matchStatus == NBiometricStatus.OK) {
                             val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
 
-                            Log.d("CardReaderViewModel", "Match score with ${profile.name}: $score")
+                            Log.d("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] ${profile.name}: Score = $score")
 
                             if (score > bestMatchScore) {
                                 bestMatchScore = score
                                 bestMatchProfile = profile
                             }
+                        } else {
+                            Log.d("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] ${profile.name}: No match (status: $matchStatus)")
                         }
                     } catch (e: Exception) {
-                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
+                        Log.e("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] Error comparing with ${profile.name}", e)
                     }
                 }
 
-                // INCREASED THRESHOLD to reduce false positives
-                // Face must match with score >= 90 to be considered duplicate
-                val duplicateThreshold = 90
+                val DUPLICATE_THRESHOLD = 90
 
-                if (bestMatchScore >= duplicateThreshold && bestMatchProfile != null) {
-                    Log.d("CardReaderViewModel", "Duplicate face found: ${bestMatchProfile.name}, Score: $bestMatchScore")
+                if (bestMatchScore >= DUPLICATE_THRESHOLD && bestMatchProfile != null) {
+                    Log.d("CardReaderViewModel", "✗ DUPLICATE FACE DETECTED!")
                     main.post {
                         onResult(true, "Face", bestMatchProfile)
                     }
                 } else {
-                    if (bestMatchScore > 0) {
-                        Log.d("CardReaderViewModel", "No duplicate (Best match: ${bestMatchProfile?.name}, Score: $bestMatchScore)")
-                    } else {
-                        Log.d("CardReaderViewModel", "No matches found")
-                    }
+                    Log.d("CardReaderViewModel", "✓ Face is unique (score below threshold)")
                     main.post {
                         onResult(false, null, null)
                     }
                 }
 
+                Log.d("CardReaderViewModel", "--- Duplicate Check Complete ---")
+
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error checking duplicates locally", e)
+                Log.e("CardReaderViewModel", "✗ Error checking duplicates", e)
                 main.post {
                     onResult(false, null, null)
                 }
