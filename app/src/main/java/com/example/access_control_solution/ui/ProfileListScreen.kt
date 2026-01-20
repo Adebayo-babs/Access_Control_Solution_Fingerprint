@@ -160,13 +160,13 @@ fun ProfileListScreen(
                             )
                         } else if (viewModel.isServerAvailable) {
                             Text(
-                                text = "✓ Server connected",
+                                text = "Connected",
                                 fontSize = 12.sp,
                                 color = Color.White.copy(alpha = 0.8f)
                             )
                         } else {
                             Text(
-                                text = "⚠ Offline mode",
+                                text = "Offline mode",
                                 fontSize = 12.sp,
                                 color = Color.Yellow
                             )
@@ -189,7 +189,7 @@ fun ProfileListScreen(
                                 viewModel.refreshFromServer { count, error ->
                                     isRefreshing = false
                                     if (error == null) {
-                                        refreshMessage = "✓ Synced $count profiles from server"
+                                        refreshMessage = "Synced $count profiles from database"
                                         showRefreshSnackbar = true
                                         // Reload the list
                                         viewModel.getAllProfile(
@@ -200,7 +200,7 @@ fun ProfileListScreen(
                                         )
                                     } else {
                                         loadError = error
-                                        refreshMessage = "✗ Sync failed: $error"
+                                        refreshMessage = "Sync failed: $error"
                                         showRefreshSnackbar = true
                                         // Still show local profiles
                                         viewModel.getAllProfile(
@@ -217,7 +217,7 @@ fun ProfileListScreen(
                                     callback = { profiles ->
                                         profileList = profiles
                                         isRefreshing = false
-                                        refreshMessage = "✓ Loaded ${profiles.size} local profiles"
+                                        refreshMessage = " Loaded ${profiles.size} local profiles"
                                         showRefreshSnackbar = true
                                     },
                                     forceRefresh = true
