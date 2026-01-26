@@ -1,5 +1,6 @@
 package com.example.access_control_solution.viewModel
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
@@ -13,7 +14,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import com.example.access_control_solution.api_models.AccessLog
+import com.example.access_control_solution.api_models.ClockRequest
 import com.example.access_control_solution.api_models.ProfileSyncManager
+import com.example.access_control_solution.api_models.RetrofitClient
 import com.example.access_control_solution.data.AppDatabase
 import com.example.access_control_solution.data.ProfileEntity
 import com.example.neurotecsdklibrary.NeurotecLicenseHelper
@@ -33,10 +37,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import okhttp3.internal.http2.Settings
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.lang.Error
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.EnumSet
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 
 data class FaceDetectionFeedback(
@@ -630,21 +640,21 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 val DUPLICATE_THRESHOLD = 90
 
                 if (bestMatchScore >= DUPLICATE_THRESHOLD && bestMatchProfile != null) {
-                    Log.d("CardReaderViewModel", "✗ DUPLICATE FACE DETECTED!")
+                    Log.d("CardReaderViewModel", " DUPLICATE FACE DETECTED!")
                     main.post {
                         onResult(true, "Face", bestMatchProfile)
                     }
                 } else {
-                    Log.d("CardReaderViewModel", "✓ Face is unique (score below threshold)")
+                    Log.d("CardReaderViewModel", " Face is unique (score below threshold)")
                     main.post {
                         onResult(false, null, null)
                     }
                 }
 
-                Log.d("CardReaderViewModel", "--- Duplicate Check Complete ---")
+                Log.d("CardReaderViewModel", " Duplicate Check Complete")
 
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "✗ Error checking duplicates", e)
+                Log.e("CardReaderViewModel", " Error checking duplicates", e)
                 main.post {
                     onResult(false, null, null)
                 }
@@ -855,83 +865,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     }
 
 
-
-    private fun checkForDuplicates(
-        lagId: String,
-        faceTemplate: ByteArray,
-        onResult: (isDuplicate: Boolean, duplicateType: String?, existingProfile: ProfileEntity?) -> Unit
-    ) {
-        dbExecutor.execute {
-            try {
-                // Check if LAG ID already exists
-                val existingByLagId = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getProfileByLagId(lagId)
-
-                if (existingByLagId != null) {
-                    main.post {
-                        onResult(true, "LAG ID", existingByLagId)
-                    }
-                    return@execute
-                }
-
-                // Check if face template matches any existing profile
-                val allProfiles = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getAllProfile()
-
-                if (allProfiles.isEmpty()) {
-                    main.post {
-                        onResult(false, null, null)
-                    }
-                    return@execute
-                }
-
-                // Create subject for the new face template
-                val newFaceSubject = NSubject()
-                newFaceSubject.setTemplateBuffer(NBuffer(faceTemplate))
-
-                // Check against each existing profile
-                for (profile in allProfiles) {
-                    try {
-                        val existingSubject = NSubject()
-                        existingSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
-
-                        val matchStatus = biometricClient?.verify(newFaceSubject, existingSubject)
-
-                        if (matchStatus == NBiometricStatus.OK) {
-                            val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
-
-                            // Use a high threshold for duplicate detection (e.g., 80)
-                            val duplicateThreshold = 80
-
-                            if (score >= duplicateThreshold) {
-                                Log.d("CardReaderViewModel", "Duplicate face found: ${profile.name}, Score: $score")
-                                main.post {
-                                    onResult(true, "Face", profile)
-                                }
-                                return@execute
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
-                    }
-                }
-
-                // No duplicates found
-                main.post {
-                    onResult(false, null, null)
-                }
-
-            } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error checking duplicates", e)
-                main.post {
-                    onResult(false, null, null)
-                }
-            }
-        }
-    }
-
     fun verifyFaceAgainstDatabase(onResult: (ProfileEntity?, Int) -> Unit) {
         executor.execute {
             try {
@@ -991,6 +924,28 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
 
                 val threshold = 48
                 val finalMatch = if (bestScore >= threshold) bestMatch else null
+
+                // Log face verification access
+                if (finalMatch != null) {
+                    logAccessAttempt(
+                        lagId = finalMatch.lagId,
+                        name = finalMatch.name,
+                        accessGranted = true,
+                        accessType = "FACE"
+                    )
+
+                    // Auto clock-in on successful face verification
+                    clockInOut(finalMatch.lagId, finalMatch.name, action = null) { success, message ->
+                        Log.d("CardReaderViewModel", "Auto clock-in: $message")
+                    }
+                } else {
+                    logAccessAttempt(
+                        lagId = "UNKNOWN",
+                        name = "Unknown",
+                        accessGranted = false,
+                        accessType = "FACE"
+                    )
+                }
 
                 main.post {
                     status = if (finalMatch != null) {
@@ -1250,6 +1205,28 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
 
                 val exists = profile != null
 
+                // Log the access attempt
+                if (exists && profile != null) {
+                    logAccessAttempt(
+                        lagId = lagId,
+                        name = profile.name,
+                        accessGranted = true,
+                        accessType = "CARD"
+                    )
+
+                    // Auto clock-in on successful card tap
+                    clockInOut(lagId, profile.name, action = null) { success, message ->
+                        Log.d("CardReaderViewModel", "Auto clock-in: $message")
+                    }
+                }else {
+                    logAccessAttempt(
+                        lagId = lagId,
+                        name = "Unknown",
+                        accessGranted = false,
+                        accessType = "CARD"
+                    )
+                }
+
                 main.post {
                     status = if (exists) {
                         "Access Granted: ${profile?.name}"
@@ -1269,6 +1246,155 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+
+    // Log access attempt
+    @SuppressLint("HardwareIds")
+    private fun logAccessAttempt(
+        lagId: String,
+        name: String,
+        accessGranted: Boolean,
+        accessType: String = "CARD"
+    ) {
+        if (!isServerAvailable) return
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val deviceId = android.provider.Settings.Secure.getString(
+                    getApplication<Application>().contentResolver,
+                    android.provider.Settings.Secure.ANDROID_ID
+                )
+
+                val localTimeZone = Calendar.getInstance()
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                dateFormat.timeZone = localTimeZone.timeZone
+                val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                timeFormat.timeZone = localTimeZone.timeZone
+
+                val accessLog = AccessLog(
+                    lagId = lagId,
+                    name = name,
+                    accessGranted = accessGranted,
+                    accessType = accessType,
+                    deviceId = deviceId,
+                    timestamp = System.currentTimeMillis(),
+                    date = dateFormat.format(Date()),
+                    time = timeFormat.format(Date())
+                )
+
+                val response = RetrofitClient.apiService.logAccess(accessLog)
+                if (response.isSuccessful) {
+                    Log.d("CardReaderViewModel", "Access logged: $name - ${if (accessGranted) "GRANTED" else "DENIED"}")
+                }
+            } catch (e: Exception) {
+                Log.d("CardReaderViewModel", "Failed to log access",e)
+            }
+        }
+    }
+
+    // Clock In/Out
+    fun clockInOut(
+        lagId: String,
+        name: String,
+        action: String? = null,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        if (!isServerAvailable) {
+            main.post { onResult(false, "")}
+            return
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val clockAction = if (action != null) {
+                    action
+                } else {
+                    val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
+                    try {
+                        val statusResponse = RetrofitClient.apiService.getAttendance(
+                            lagId = lagId,
+                            startDate = today,
+                            endDate = today,
+                            limit = 1
+                        )
+
+                        if (statusResponse.isSuccessful) {
+                            val responseBody = statusResponse.body()
+
+                            val records = when {
+                                responseBody?.success == true ->
+                                    responseBody.records
+                                else -> emptyList()
+                            }
+
+                            val determinedAction = if (records.isEmpty()) {
+                                "IN"
+                            } else {
+                                val todayRecord = records.first()
+                                if (todayRecord.status == "ACTIVE") {
+                                    "OUT"
+                                } else {
+                                    // All sessions completed, clock in again
+                                    "IN"
+                                }
+                            }
+                            determinedAction
+                        } else {
+                            "IN"
+                        }
+                    } catch (e: Exception) {
+                        "IN"
+                    }
+                }
+                val request = ClockRequest(lagId, name, clockAction)
+                val response = RetrofitClient.apiService.clockInOut(request)
+
+                main.post {
+                    if (response.isSuccessful && response.body()?.success == true) {
+                        val responseBody = response.body()
+                        // Convert server timestamp to local time
+                        responseBody?.attendance?.let { attendance ->
+                            // Get the latest session
+                            val sessions = attendance.sessions
+                            if (!sessions.isNullOrEmpty()) {
+                                val latestSession = sessions.last()
+                                val serverTimestamp = if (clockAction == "IN") {
+                                    latestSession.clockIn
+                                } else {
+                                    latestSession.clockOut
+                                }
+                                serverTimestamp?.let { timestamp ->
+                                    val localTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).apply {
+                                        timeZone = TimeZone.getDefault()
+                                    }
+                                    val timeStr = localTimeFormat.format(Date(timestamp))
+
+                                    val message = if (clockAction == "IN") {
+                                        "Clocked in at $timeStr"
+                                    } else {
+                                        val sessionDuration = latestSession.durationFormatted ?: "0h 0m"
+                                        val totalDuration = attendance.totalDurationFormatted ?: "0h 0m"
+                                        "Clocked out at $timeStr\nSession: $sessionDuration\nTotal today: $totalDuration"
+                                    }
+                                    onResult(true, message)
+                                    return@post
+                                }
+                            }
+                        }
+                        onResult(true, " ") // Clocked in/out successfully
+                    } else {
+                        val error = response.body()?.message ?: "" // Failed to clock in/out
+                        onResult(false, error)
+                    }
+                }
+            } catch (e: Exception) {
+                main.post {
+                    onResult(false, e.message ?: "Unknown error")
+                }
+            }
+        }
+    }
+
     fun invalidateCache() {
         cachedProfiles = null
         cacheTimestamp = 0
@@ -1278,10 +1404,6 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     fun clearCapturedStaffFace() {
         capturedProfileFace = null
         capturedProfileTemplate = null
-    }
-
-    fun dismissDialog() {
-        _dialogState.value = DialogState(showDialog = false, message = "")
     }
 
     override fun onCleared() {

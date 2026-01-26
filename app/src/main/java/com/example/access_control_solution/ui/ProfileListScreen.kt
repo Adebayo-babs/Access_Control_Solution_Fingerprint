@@ -3,6 +3,7 @@ package com.example.access_control_solution.ui
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -75,6 +76,9 @@ fun ProfileListScreen(
     onBack: () -> Unit,
     onAddProfile: () -> Unit
 ) {
+
+    BackHandler { onBack() }
+
     var profileList by remember { mutableStateOf<List<ProfileEntity>>(emptyList()) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var profileToDelete by remember { mutableStateOf<ProfileEntity?>(null) }

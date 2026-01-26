@@ -41,6 +41,45 @@ interface ProfileApiService {
     @GET("api/profiles/stats/count")
     suspend fun getProfilesCount(): Response<ApiResponse<Int>>
 
+    @POST("api/access/logs")
+    suspend fun logAccess(
+        @Body accessLog: AccessLog
+    ): Response<AccessLogResponse>
+
+    @GET("api/access/logs")
+    suspend fun getAccessLogs(
+        @Query("lagId") lagId: String? = null,
+        @Query("accessGranted") accessGranted: Boolean? = null,
+        @Query("startDate") startDate: String? = null,
+        @Query("endDate") endDate: String? = null,
+        @Query("limit") limit: Int = 100,
+        @Query("page") page: Int = 1
+    ): Response<AccessLogResponse>
+
+    @GET("api/access/stats")
+    suspend fun getAccessStats(
+        @Query("startDate") startDate: String? = null,
+        @Query("endDate") endDate: String? = null
+    ): Response<AccessStatsResponse>
+
+    @POST("api/attendance/clock")
+    suspend fun clockInOut(
+        @Body request: ClockRequest
+    ): Response<ClockInOutResponse>
+
+    @GET("api/attendance")
+    suspend fun getAttendance(
+        @Query("lagId") lagId: String? = null,
+        @Query("startDate") startDate: String? = null,
+        @Query("endDate") endDate: String? = null,
+        @Query("status") status: String? = null,
+        @Query("limit") limit: Int = 100,
+        @Query("page") page: Int = 1
+    ): Response<AttendanceResponse>
+
+    @GET("api/attendance/today")
+    suspend fun getTodayAttendance(): Response<TodayAttendanceResponse>
+
     @GET("api/health")
     suspend fun healthCheck(): Response<ApiResponse<String>>
 

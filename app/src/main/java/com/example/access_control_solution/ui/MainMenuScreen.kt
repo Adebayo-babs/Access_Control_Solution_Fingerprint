@@ -1,6 +1,20 @@
 package com.example.access_control_solution.ui
 
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.util.Log
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,33 +25,33 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material.icons.filled.Face
+import androidx.compose.material.ripple.rememberRipple
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.example.access_control_solution.viewModel.CardReaderViewModel
-import kotlinx.coroutines.delay
 
 
 @Composable
@@ -48,10 +62,30 @@ fun MainMenuScreen(
     onNavigateToProfileList: () -> Unit
 ) {
 
-    val dialogState by viewModel.dialogState.collectAsState()
+    // Pulsing animation
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseScale"
+    )
 
     Box(
-        modifier = Modifier.fillMaxSize()
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF1a1a2e),
+                        Color(0xFF16213e),
+                        Color(0xFF0f3460)
+                    )
+                )
+            )
     ) {
         Column(
             modifier = Modifier
@@ -60,6 +94,7 @@ fun MainMenuScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Top
         ) {
+            // Header
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -67,22 +102,32 @@ fun MainMenuScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
+                Column {
+                    Text(
+                        text = "ACCESS VALIDATOR",
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.White,
+                        letterSpacing = 1.5.sp
+                    )
+                    Text(
+                        text = "Secure Entry System",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Normal,
+                        color = Color.White.copy(alpha = 0.6f),
+                        letterSpacing = 0.5.sp
+                    )
+                }
 
-                Text(
-                    text = "ACCESS VALIDATOR",
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Black
-                )
-
-                // Profile Button
+                // Profile List Button
                 Card(
                     onClick = onNavigateToProfileList,
                     shape = CircleShape,
                     colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFF00A86B)
+                        containerColor = Color(0xFF00D9FF)
                     ),
-                    modifier = Modifier.size(48.dp)
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+                    modifier = Modifier.size(60.dp)
                 ) {
                     Box(
                         modifier = Modifier.fillMaxSize(),
@@ -90,171 +135,227 @@ fun MainMenuScreen(
                     ) {
                         Text(
                             text = "👤",
-                            fontSize = 24.sp
+                            fontSize = 30.sp
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(40.dp))
+            Spacer(modifier = Modifier.height(30.dp))
 
-            // Server Status Card
-//            Card(
-//                modifier = Modifier.fillMaxWidth(),
-//                colors = CardDefaults.cardColors(
-//                    containerColor = if (viewModel.isServerAvailable)
-//                        Color(0xFFE8F5E9) else Color(0xFFFFEBEE)
-//                ),
-//                shape = RoundedCornerShape(12.dp),
-//                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-//            ) {
-//                Row(
-//                    modifier = Modifier
-//                        .fillMaxWidth()
-//                        .padding(16.dp),
-//                    verticalAlignment = Alignment.CenterVertically
-//                ) {
-//                    Text(
-//                        text = if (viewModel.isServerAvailable) "🟢" else "🔴",
-//                        fontSize = 24.sp
-//                    )
-//                    Spacer(modifier = Modifier.width(12.dp))
-//                    Column {
-//                        Text(
-//                            text = if (viewModel.isServerAvailable)
-//                                "Server Online" else "Offline Mode",
-//                            fontWeight = FontWeight.Bold,
-//                            fontSize = 16.sp,
-//                            color = Color.Black
-//                        )
-//                        Text(
-//                            text = if (viewModel.isServerAvailable)
-//                                "Profiles synced across all devices"
-//                            else
-//                                "Using local profiles only",
-//                            fontSize = 12.sp,
-//                            color = Color.Gray
-//                        )
-//                    }
-//                }
-//            }
-//
-//            Spacer(modifier = Modifier.height(32.dp))
-
-            // Tap Card Button
+            // Main Verification Card
             Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFF00A86B)
-                ),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 26.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    // White circle with NFC icon
-                    Box(
-                        modifier = Modifier
-                            .size(80.dp)
-                            .clip(CircleShape)
-                            .background(Color.White),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "))))",
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF00A86B),
-                            modifier = Modifier.padding(start = 8.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(20.dp))
-
-                    Text(
-                        text = "Tap your card",
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Tap your card on the device to verify your identity",
-                        fontSize = 14.sp,
-                        color = Color.White,
-                        textAlign = TextAlign.Center
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // "OR" Divider
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(1.dp)
-                        .background(Color.LightGray)
-                )
-                Text(
-                    text = "OR",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Gray,
-                    modifier = Modifier.padding(horizontal = 16.dp)
-                )
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(1.dp)
-                        .background(Color.LightGray)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // Verify Face Button
-            Button(
-                onClick = onNavigateToFaceCapture,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(70.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF2196F3)
+                    .scale(pulseScale),
+                shape = RoundedCornerShape(32.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color.Transparent
                 ),
-                elevation = ButtonDefaults.buttonElevation(
-                    defaultElevation = 4.dp,
-                    pressedElevation = 8.dp
-                )
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
             ) {
-                Row(
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "📷",
-                        fontSize = 28.sp
-                    )
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Column(
-                        horizontalAlignment = Alignment.Start
-                    ) {
-                        Text(
-                            text = "Verify Face",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(
+                                    Color(0xFF2D3561),
+                                    Color(0xFF1F2544)
+                                )
+                            )
                         )
+                        .padding(48.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        // NFC Section
+                        Text(
+                            text = "Tap your card on the device",
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 30.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // NFC Icon
+                        Box(
+                            modifier = Modifier
+                                .size(160.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.radialGradient(
+                                        colors = listOf(
+                                            Color(0xFF00FFB9),
+                                            Color(0xFF00D9A8),
+                                            Color(0xFF00A86B)
+                                        )
+                                    )
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            // Animated rings
+                            Box(
+                                modifier = Modifier
+                                    .size(180.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF00FFB9).copy(alpha = 0.1f))
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(200.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF00FFB9).copy(alpha = 0.05f))
+                            )
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = "))))",
+                                    fontSize = 64.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.White
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "NFC",
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White.copy(alpha = 0.95f),
+                                    letterSpacing = 3.sp
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(28.dp))
+
+                        // Elegant Divider
+                        Row(
+                            modifier = Modifier.fillMaxWidth(0.6f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(2.dp)
+                                    .background(
+                                        Brush.horizontalGradient(
+                                            colors = listOf(
+                                                Color.Transparent,
+                                                Color(0xFF00D9FF).copy(alpha = 0.5f)
+                                            )
+                                        )
+                                    )
+                            )
+
+                            Box(
+                                modifier = Modifier
+                                    .padding(horizontal = 20.dp)
+                                    .size(50.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF00D9FF).copy(alpha = 0.2f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "OR",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFF00D9FF),
+                                    letterSpacing = 2.sp
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(2.dp)
+                                    .background(
+                                        Brush.horizontalGradient(
+                                            colors = listOf(
+                                                Color(0xFF00D9FF).copy(alpha = 0.5f),
+                                                Color.Transparent
+                                            )
+                                        )
+                                    )
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(28.dp))
+
+                        // Face Recognition Section
+                        Text(
+                            text = "Click the face icon to verify with your face",
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 30.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Face Icon
+                        Box(
+                            modifier = Modifier
+                                .size(160.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.radialGradient(
+                                        colors = listOf(
+                                            Color(0xFF9D84FF),
+                                            Color(0xFF7B68EE),
+                                            Color(0xFF5A4FCF)
+                                        )
+                                    )
+                                )
+                                .clickable(
+                                    indication = rememberRipple(bounded = true),
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { onNavigateToFaceCapture() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            // Animated rings
+                            Box(
+                                modifier = Modifier
+                                    .size(180.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF9D84FF).copy(alpha = 0.1f))
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(200.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF9D84FF).copy(alpha = 0.05f))
+                            )
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Face,
+                                    contentDescription = "Face Recognition",
+                                    modifier = Modifier.size(80.dp),
+                                    tint = Color.White
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "FACE",
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White.copy(alpha = 0.95f),
+                                    letterSpacing = 3.sp
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
                     }
                 }
             }
