@@ -34,7 +34,7 @@ fun CameraPreviewColoured(
     var lastFrameTime by remember { mutableStateOf(0L) }
 
     // Continuously capture frames from the active camera
-    LaunchedEffect(viewModel.biometricClient) {
+    LaunchedEffect(Unit) {
         while (isActive) {
             try {
                 withContext(Dispatchers.IO) {

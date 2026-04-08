@@ -57,11 +57,42 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            excludes += listOf(
+                "**/libIDFpr.so",
+                "**/libIDFinger.so",
+                "lib/armeabi-v7a/libBioMiniJni.so",
+                "lib/arm64-v8a/libBioMiniJni.so",
+                "lib/armeabi-v7a/libbiominicommon.so",
+                "lib/arm64-v8a/libbiominicommon.so",
+                "lib/armeabi-v7a/libc++_shared.so",
+                "lib/arm64-v8a/libc++_shared.so",
+                "lib/armeabi-v7a/libsuprema_libusb.so",
+                "lib/arm64-v8a/libsuprema_libusb.so",
+                "lib/armeabi-v7a/libusb1.0.so",
+                "lib/arm64-v8a/libusb1.0.so"
+            )
             pickFirsts += listOf(
+                // BioMini JNI libraries
+                "lib/armeabi-v7a/libBioMiniJni.so",
+                "lib/arm64-v8a/libBioMiniJni.so",
+                "lib/armeabi-v7a/libbiominicommon.so",
+                "lib/arm64-v8a/libbiominicommon.so",
+
+                // NCore and JNA
                 "lib/armeabi-v7a/libNCore.so",
                 "lib/arm64-v8a/libNCore.so",
                 "lib/x86/libNCore.so",
                 "lib/x86_64/libNCore.so",
+
+                // C++ runtime
+                "lib/armeabi-v7a/libc++_shared.so",
+                "lib/arm64-v8a/libc++_shared.so",
+
+                // USB library
+                "lib/armeabi-v7a/libusb1.0.so",
+                "lib/arm64-v8a/libusb1.0.so",
+
+                // JNA
                 "**/libjnidispatch.so"
             )
         }
@@ -82,32 +113,26 @@ android {
                 "jquery-ui.overrides.css",
                 "jquery/jquery-ui.min.css",
                 "index-all.html",
-                "**", "META-INF/**", "element-list", "legal/ASSEMBLY_EXCEPTION", "**/*.html", "**/*.png", "**/*.js", "**/*.css", "**/*.md"
+                "**", "META-INF/**", "element-list", "legal/ASSEMBLY_EXCEPTION",
+                "**/*.html", "**/*.png", "**/*.js", "**/*.css", "**/*.md"
             )
             pickFirsts += listOf(
                 "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
             )
-
-            jniLibs {
-                useLegacyPackaging = true
-                pickFirsts += listOf(
-                    "**/libjnidispatch.so",
-                    "lib/**/libNCore.so"
-                )
-            }
-        }
-    }
-
-    packagingOptions {
-        resources {
-            excludes += "member-search-index.zip"
         }
     }
 }
 
 dependencies {
 
+    // Neurotec SDK
     implementation(project(":NeurotecSDKLibrary"))
+
+    // IsoReader Library
+    implementation(project(":IsoReader"))
+
+    // Telpo Library
+    implementation(project(":TelpoLib"))
 
     implementation("androidx.core:core:1.12.0")
     implementation("androidx.core:core-ktx:1.12.0")
@@ -176,5 +201,10 @@ dependencies {
     // Pull-to-refresh functionality
     implementation ("com.google.accompanist:accompanist-swiperefresh:0.32.0")
 
+    // Suprema bioMini Finger scanner
+    implementation(files("libs/libBioMini.aar"))
+
+    // Telpo API
+    implementation(files("libs/telpo_api_2106111001.jar"))
 
 }

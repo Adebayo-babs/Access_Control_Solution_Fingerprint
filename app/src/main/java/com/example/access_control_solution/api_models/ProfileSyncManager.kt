@@ -35,6 +35,7 @@ class ProfileSyncManager(private val context: Context) {
             faceTemplate = Base64.encodeToString(entity.faceTemplate, Base64.NO_WRAP),
             faceImage = if (includeImages) Base64.encodeToString(entity.faceImage, Base64.NO_WRAP) else null,
             thumbnail = entity.thumbnail?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
+            fingerprintTemplate = entity.fingerprintTemplate?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
             timestamp = entity.timestamp
         )
     }
@@ -47,6 +48,7 @@ class ProfileSyncManager(private val context: Context) {
             faceTemplate = Base64.decode(dto.faceTemplate, Base64.NO_WRAP),
             faceImage = dto.faceImage?.let { Base64.decode(it, Base64.NO_WRAP) } ?: ByteArray(0),
             thumbnail = dto.thumbnail?.let { Base64.decode(it, Base64.NO_WRAP) },
+            fingerprintTemplate = dto.fingerprintTemplate?.let { Base64.decode(it, Base64.NO_WRAP) },
             timestamp = dto.timestamp
         )
     }
@@ -122,7 +124,7 @@ class ProfileSyncManager(private val context: Context) {
                 Log.d(TAG, "Loading all profiles from server...")
 
                 val response = apiService.getAllProfiles(
-                    includeImages = false, // Don't include full images initially for performance
+                    includeImages = true,
                     includeThumbnails = true
                 )
 
@@ -135,44 +137,28 @@ class ProfileSyncManager(private val context: Context) {
                     // Clear local database
                     db.profileDao().deleteAll()
 
-                    var loaded = 0
-
-                    // Insert all profiles from server
-                    profiles.forEach { dto ->
+                    val entities = profiles.mapNotNull { dto ->
                         try {
-                            // Fetch full profile with image if needed
-                            val fullProfileResponse = apiService.getProfileById(dto.id ?: "")
-
-                            if (fullProfileResponse.isSuccessful && fullProfileResponse.body()?.success == true) {
-                                val fullDto = fullProfileResponse.body()?.data
-                                if (fullDto != null) {
-                                    val entity = dtoToEntity(fullDto)
-                                    db.profileDao().insert(entity)
-                                    loaded++
-                                    Log.d(TAG, "Loaded profile: ${entity.name}")
-                                }
-                            } else {
-                                // Fallback to dto without full image
-                                if (dto.faceImage != null) {
-                                    val entity = dtoToEntity(dto)
-                                    db.profileDao().insert(entity)
-                                    loaded++
-                                }
-                            }
+                            if (dto.faceImage == null) return@mapNotNull  null
+                            dtoToEntity(dto)
                         } catch (e: Exception) {
-                            Log.e(TAG, "Error loading profile: ${dto.name}", e)
+                            Log.e(TAG, "Error converting profile: ${dto.name}", e)
+                            null
                         }
+                    }
+
+                    // Insert all
+                    if (entities.isNotEmpty()) {
+                        db.profileDao().insertAll(entities)
                     }
 
                     // Update last sync timestamp
                     prefs.edit().putLong(PREF_LAST_SYNC, serverTimestamp).apply()
 
-                    Log.d(TAG, "Loaded $loaded profiles from server")
-                    Result.success(loaded)
+                    Log.d(TAG, "Loaded ${entities.size} profiles from server")
+                    Result.success(entities.size)
                 } else {
-                    val error = "Failed to load profiles from server"
-                    Log.e(TAG, error)
-                    Result.failure(Exception(error))
+                    Result.failure(Exception("Failed to load profiles from server"))
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error loading profiles from server", e)

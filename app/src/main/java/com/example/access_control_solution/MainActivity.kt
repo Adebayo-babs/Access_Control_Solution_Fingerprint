@@ -3,6 +3,8 @@ package com.example.access_control_solution
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.hardware.usb.UsbManager
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.nfc.NfcAdapter
@@ -15,33 +17,30 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.lifecycleScope
 import com.example.access_control_solution.data.ProfileEntity
+import com.example.access_control_solution.reader.ContactSmartCardReader
 import com.example.access_control_solution.reader.OptimizedCardDataReader
+import com.example.access_control_solution.reader.SAMCardReader
 import com.example.access_control_solution.ui.AddProfileScreen
 import com.example.access_control_solution.ui.CardAccessResultScreen
 import com.example.access_control_solution.ui.FaceCaptureScreen
+import com.example.access_control_solution.ui.FingerprintVerificationScreen
 import com.example.access_control_solution.ui.MainMenuScreen
 import com.example.access_control_solution.ui.ProfileListScreen
 import com.example.access_control_solution.ui.SplashScreen
 import com.example.access_control_solution.ui.VerificationResultScreen
 import com.example.access_control_solution.ui.theme.Access_Control_SolutionTheme
 import com.example.access_control_solution.viewModel.CardReaderViewModel
-import kotlinx.coroutines.CoroutineScope
+import com.example.isoreader.IsoReader
+import com.telpo.tps550.api.reader.SmartCardReader
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -49,12 +48,31 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+        private const val SAM_PASSWORD = "2EC93602960F9B09D858BB00B2C8E486"
+        private const val PREF_FILE = "CardAppPrefs"
+        private const val PREF_SAM_PASSWORD = "SAM_PASSWORD"
+    }
+
+    // SAM Password - Persisted in SharedPreferences
+    private lateinit var sharedPreferences: SharedPreferences
+
+    private fun getSAMPassword(): String = sharedPreferences.getString(
+        PREF_SAM_PASSWORD, SAM_PASSWORD
+    ) ?: SAM_PASSWORD
+
+    fun saveSAMPassword(password: String) {
+        sharedPreferences.edit().putString(PREF_SAM_PASSWORD, password).apply()
+        Log.d(TAG, "SAM Password saved: ${password.take(8)}...")
     }
 
     private var nfcAdapter: NfcAdapter? = null
     private var pendingIntent: PendingIntent? = null
     private var intentFiltersArray: Array<IntentFilter>? = null
     private var techListsArray: Array<Array<String>>? = null
+
+    private var lastNfcProcessedTime = 0L
+    private val NFC_DEBOUNCE_MS = 2000L
+    private var samIsoReader: IsoReader? = null
 
     private val viewModel: CardReaderViewModel by viewModels()
 
@@ -66,12 +84,11 @@ class MainActivity : ComponentActivity() {
         ADD_PROFILE,
         PROFILE_LIST,
         VERIFICATION_RESULT,
-        ACCESS_RESULT
+        ACCESS_RESULT,
+        FINGERPRINT_VERIFY
     }
 
     private var toneGenerator: ToneGenerator? = null
-
-    // Navigation state
     private var currentScreen by mutableStateOf(Screen.SPLASH)
 
     // Verification result data
@@ -88,6 +105,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestUsbPermissionIfNeeded()
+
+        initSamSlot()
+
+        sharedPreferences = getSharedPreferences(PREF_FILE, MODE_PRIVATE)
 
         toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 1000)
 
@@ -106,9 +128,7 @@ class MainActivity : ComponentActivity() {
                     when(currentScreen) {
                         Screen.SPLASH -> {
                             SplashScreen (
-                                onNavigateToMain = {
-                                    currentScreen = Screen.MAIN_MENU
-                                }
+                                onNavigateToMain = { currentScreen = Screen.MAIN_MENU }
                             )
                         }
 
@@ -116,18 +136,28 @@ class MainActivity : ComponentActivity() {
                             MainMenuScreen(
                                 viewModel = viewModel,
                                 onNavigateToFaceCapture = {
+                                    viewModel.reset()
                                     currentScreen = Screen.FACE_CAPTURE
                                 },
                                 onNavigateToAddProfile = {
                                     isAddProfileScreenActive = true
                                     currentScreen = Screen.ADD_PROFILE
                                 },
-                                onNavigateToProfileList = {
-                                    currentScreen = Screen.PROFILE_LIST
-                                }
+                                onNavigateToProfileList = { currentScreen = Screen.PROFILE_LIST },
+                                onNavigateToFingerprintVerify = {
+                                    currentScreen = Screen.FINGERPRINT_VERIFY
+                                },
+                                onChangeSAMPassword = { saveSAMPassword(it) },
+
                             )
-                            viewModel.reset()
+
                         }
+
+                        Screen.FINGERPRINT_VERIFY ->
+                            FingerprintVerificationScreen(
+                                viewModel = viewModel,
+                                onBack = { currentScreen = Screen.MAIN_MENU}
+                            )
 
                         Screen.FACE_CAPTURE -> {
                             FaceCaptureScreen(
@@ -226,11 +256,7 @@ class MainActivity : ComponentActivity() {
         val tech = IntentFilter(NfcAdapter.ACTION_TECH_DISCOVERED)
         val tag = IntentFilter(NfcAdapter.ACTION_TAG_DISCOVERED)
         intentFiltersArray = arrayOf(ndef, tech, tag)
-
-        // Setup technology filters
-        techListsArray = arrayOf(
-            arrayOf(IsoDep::class.java.name)
-        )
+        techListsArray = arrayOf(arrayOf(IsoDep::class.java.name))
     }
 
     override fun onResume() {
@@ -245,6 +271,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            Log.d("MainActivity", "USB device attached via onNewIntent")
+            return
+        }
         handleIntent(intent)
     }
 
@@ -259,9 +289,102 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun requestUsbPermissionIfNeeded() {
+        val usbManager = getSystemService(USB_SERVICE) as android.hardware.usb.UsbManager
+        usbManager.deviceList.values
+            .filter { it.vendorId == 0x16D1 }
+            .forEach { device ->
+                if (!usbManager.hasPermission(device)) {
+                    val permissionIntent = PendingIntent.getBroadcast(
+                        this, 0,
+                        Intent("com.example.access_control_solution.USB_PERMISSION"),
+                        PendingIntent.FLAG_IMMUTABLE
+                    )
+                    usbManager.requestPermission(device, permissionIntent)
+                    Log.d(TAG, "Requesting USB permission for Suprema scanner")
+                } else {
+                    Log.d(TAG, "Suprema scanner permission already granted")
+                }
+            }
+    }
 
+    private fun initSamSlot() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "=== SAM SLOT DIAGNOSTICS ===")
+
+                for (slotIndex in 0..2) {
+                    try {
+                        Log.d(TAG, "Trying SAM slot $slotIndex...")
+                        val smartCardReader = SmartCardReader(this@MainActivity, slotIndex)
+                        val slot = ContactSmartCardReader(smartCardReader)
+
+                        val opened = slot.open()
+                        Log.d(TAG, "Slot $slotIndex open(): $opened")
+
+                        if (opened) {
+                            // Probe SAM with SELECT — any response means hardware is present
+                            try {
+                                val aidBytes = byteArrayOf(
+                                    0xA0.toByte(), 0x00, 0x00, 0x00, 0x77,
+                                    0xAB.toByte(), 0xCA.toByte()
+                                )
+                                val selectCmd = byteArrayOf(
+                                    0x00, 0xA4.toByte(), 0x04, 0x00,
+                                    aidBytes.size.toByte()
+                                ) + aidBytes
+
+                                val response = slot.transceive(selectCmd)
+                                if (response != null && response.size >= 2) {
+                                    val sw = ((response[response.size - 2].toInt() and 0xFF) shl 8) or
+                                            (response[response.size - 1].toInt() and 0xFF)
+                                    Log.d(TAG, "Slot $slotIndex probe SW: ${"%04X".format(sw)}")
+                                    Log.d(TAG, "Slot $slotIndex response: ${response.joinToString("") { byte -> "%02X".format(byte) }}")
+
+                                    when (sw) {
+                                        0x9000 -> Log.d(TAG, "✓ SAM AID selected successfully on slot $slotIndex")
+                                        0x6A82 -> Log.w(TAG, "Slot $slotIndex: SAM present but AID not found — wrong AID")
+                                        else   -> Log.w(TAG, "Slot $slotIndex: unexpected SW ${"%04X".format(sw)}")
+                                    }
+
+                                    // Any response means SAM hardware is responding
+                                    samIsoReader = slot
+                                    Log.d(TAG, "✓ SAM found in slot $slotIndex")
+                                    break
+                                } else {
+                                    Log.w(TAG, "Slot $slotIndex: null/empty response — no SAM seated")
+                                    slot.close()
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Slot $slotIndex probe failed: ${e.message}")
+                                slot.close()
+                            }
+                        } else {
+                            Log.w(TAG, "Slot $slotIndex failed to open")
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Slot $slotIndex exception: ${e.message}")
+                    }
+                }
+
+                if (samIsoReader == null) {
+                    Log.e(TAG, "✗ No SAM found in any slot — check SAM is seated correctly")
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "SAM init failed entirely: ${e.message}", e)
+                samIsoReader = null
+            }
+        }
+    }
 
     private fun processNFCTag(tag: Tag) {
+        val now = System.currentTimeMillis()
+        if (now - lastNfcProcessedTime < NFC_DEBOUNCE_MS) {
+            Log.d(TAG, "Duplicate NFC intent ignored")
+            return
+        }
+        lastNfcProcessedTime = now
         Log.d(TAG, "Card tapped!")
         playSuccessSound()
 
@@ -271,9 +394,17 @@ class MainActivity : ComponentActivity() {
             // Launch coroutine to read card data
             lifecycleScope.launch {
                 try {
-                    val cardReader = OptimizedCardDataReader()
+                    val cardReader = OptimizedCardDataReader(this@MainActivity)
+
+                    val needBiometrics = currentScreen == Screen.ADD_PROFILE
+
                     val cardData = withContext(Dispatchers.IO) {
-                        cardReader.readCardDataAsync(isoDep)
+                        cardReader.readCardDataAsync(
+                            isoDep = isoDep,
+                            fullRead = needBiometrics,
+                            samPassword = getSAMPassword(),
+                            samIsoReader = samIsoReader
+                        )
                     }
 
                     // Check which screen is active
@@ -318,6 +449,34 @@ class MainActivity : ComponentActivity() {
         } else {
             viewModel.setCardReadError("Could not read complete card data")
         }
+
+        if (cardData.faceImage != null) {
+            viewModel.setBiometricDataFromCard(
+                faceImage = cardData.faceImage
+            )
+        }
+
+        // Convert card WSQ fingerprints to Neurotec template and store in viewModel
+        if (cardData.fingerprintData.isNotEmpty()) {
+            viewModel.extractAndStoreFingerprintFromCard(cardData.fingerprintData) { template ->
+                if (template != null) {
+                    // Store as a single-finger FingerprintData carrying NTemplates bytes
+                    viewModel.setFingerprintsFromCard(
+                        listOf(
+                            SAMCardReader.FingerprintData(
+                                template = template,
+                                fingerIndex = 0,
+                                format = "NEUROTEC"
+                            )
+                        )
+                    )
+                    Log.d(TAG, "Card fingerprint template ready for enrollment")
+                }else {
+                    Log.w(TAG, "Card fingerprint conversion failed, profile will save without fingerprint")
+                }
+
+            }
+        }
     }
 
     private fun handleCardDataForAccess(cardData: OptimizedCardDataReader.CardData) {
@@ -325,6 +484,13 @@ class MainActivity : ComponentActivity() {
 
         if (lagId != null) {
             Log.d(TAG, "LAG ID read: $lagId")
+
+            // Push biometric to viewmodel when a full read is performed
+            if (cardData.faceImage != null || cardData.fingerprintData.isNotEmpty()) {
+                viewModel.setBiometricDataFromCard(
+                    faceImage = cardData.faceImage
+                )
+            }
 
             // Check if LAG ID exists in database
             viewModel.checkLagIdInDatabase(lagId) { profile, exists ->
@@ -358,6 +524,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         // Release the tone generator when activity is destroyed
+        try {
+            samIsoReader?.close()
+        } catch (e: Exception) { /* */}
         toneGenerator?.release()
         toneGenerator = null
     }

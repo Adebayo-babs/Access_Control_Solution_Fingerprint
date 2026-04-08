@@ -1,8 +1,11 @@
 package com.example.access_control_solution.reader
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.nfc.tech.IsoDep
 import android.util.Log
+import com.common.apiutil.reader.SmartCardReader
+import com.example.isoreader.IsoReader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -17,7 +20,7 @@ import java.io.IOException
 import java.nio.charset.StandardCharsets
 import kotlin.coroutines.CoroutineContext
 
-class OptimizedCardDataReader : CoroutineScope {
+class OptimizedCardDataReader(private val context: Context) : CoroutineScope {
 
     override val coroutineContext: CoroutineContext = Dispatchers.IO + SupervisorJob()
 
@@ -78,10 +81,6 @@ class OptimizedCardDataReader : CoroutineScope {
             return bytes.joinToString("") { "%02X".format(it) }
         }
 
-        private fun isPrintableAscii(byte: Byte): Boolean {
-            val b = byte.toInt() and 0xFF
-            return b in 32..126
-        }
     }
 
     data class CardData(
@@ -92,7 +91,12 @@ class OptimizedCardDataReader : CoroutineScope {
         val pan: String?,
         val additionalInfo: Map<String, String> = emptyMap(),
         val rawData: List<String> = emptyList(),
-        val readTimeMs: Long = 0L // Track read performance
+        val readTimeMs: Long = 0L,
+
+        // FaceImage and FingerprintData are null when fullRead = false (Fast Mode)
+        val faceImage: ByteArray? = null,
+        val fingerprintData: List<SAMCardReader.FingerprintData> = emptyList()
+
     )
 
     private data class ReadResult(
@@ -102,7 +106,12 @@ class OptimizedCardDataReader : CoroutineScope {
         val error: String? = null
     )
 
-    suspend fun readCardDataAsync(isoDep: IsoDep): CardData = withContext(Dispatchers.IO) {
+    suspend fun readCardDataAsync(
+        isoDep: IsoDep,
+        fullRead: Boolean = false,
+        samPassword: String = "",
+        samIsoReader: IsoReader? = null
+    ): CardData = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         var cardId: String? = null
         var holderName: String? = null
@@ -112,14 +121,45 @@ class OptimizedCardDataReader : CoroutineScope {
         val additionalInfo = mutableMapOf<String, String>()
         val rawDataList = mutableListOf<String>()
 
+        if (fullRead) {
+
+            // Open TPS360 SAM slot
+            val samReader  = SAMCardReader()
+
+            val secureData = samReader.readSecureCardData(
+                isoDep = isoDep,
+                samReader = samIsoReader,
+                samPassword = samPassword,
+                fastMode = false // Include Biometrics
+            )
+            try {
+                samIsoReader?.close()
+            } catch (e: Exception) {
+                /* ignore */
+            }
+            val elapsed = System.currentTimeMillis() - startTime
+            return@withContext CardData(
+                cardId         = secureData.cardId,
+                holderName     = secureData.surname,
+                expirationDate = secureData.additionalInfo["expiryDate"],
+                applicationLabel = null,
+                pan            = null,
+                additionalInfo = secureData.additionalInfo,
+                rawData        = emptyList(),
+                readTimeMs     = elapsed,
+                faceImage      = secureData.faceImage,
+                fingerprintData = secureData.fingerprintData
+            )
+        }
+
         try {
-            // Step 1: Connect to card
+            // Connect to card
             withTimeout(1000L) { // 1 second total timeout
                 isoDep.connect()
                 Log.d(TAG, "Connected to card")
             }
 
-            // Step 2: Select application (try each AID with timeout)
+            // Select application (try each AID with timeout)
             var applicationSelected = false
             for (aid in CARD_AIDS) {
                 try {
@@ -157,7 +197,7 @@ class OptimizedCardDataReader : CoroutineScope {
                     additionalInfo, rawDataList, System.currentTimeMillis() - startTime)
             }
 
-            // Step 3: Get Processing Options (optional, skip if takes too long)
+            // Get Processing Options
             try {
                 val gpoCommand = getProcessingOptionsCommand()
                 val gpoResponse = withTimeout(READ_TIMEOUT_MS) {
@@ -169,7 +209,7 @@ class OptimizedCardDataReader : CoroutineScope {
                 Log.w(TAG, "GPO skipped: ${e.message}")
             }
 
-            // Step 4: Read priority records concurrently with early termination
+            // Read priority records concurrently with early termination
             val readJobs = mutableListOf<Deferred<ReadResult>>()
             val semaphore = Semaphore(MAX_CONCURRENT_READS)
 
@@ -209,7 +249,7 @@ class OptimizedCardDataReader : CoroutineScope {
                 readJobs.add(job)
             }
 
-            // Step 5: Process results as they complete (early termination)
+            // Process results as they complete (early termination)
             var foundMainData = false
 
             for (job in readJobs) {

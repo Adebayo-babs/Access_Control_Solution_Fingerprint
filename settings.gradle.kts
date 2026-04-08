@@ -16,9 +16,15 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+
+        flatDir {
+            dirs("app/libs")
+        }
     }
 }
 
 rootProject.name = "Access_Control_Solution"
 include(":app")
 include(":NeurotecSDKLibrary")
+include(":TelpoLib")
+include(":IsoReader")

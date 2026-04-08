@@ -10,7 +10,9 @@
         <option name="modules">
           <set>
             <option value="$PROJECT_DIR$" />
+            <option value="$PROJECT_DIR$/IsoReader" />
             <option value="$PROJECT_DIR$/NeurotecSDKLibrary" />
+            <option value="$PROJECT_DIR$/TelpoLib" />
             <option value="$PROJECT_DIR$/app" />
           </set>
         </option>

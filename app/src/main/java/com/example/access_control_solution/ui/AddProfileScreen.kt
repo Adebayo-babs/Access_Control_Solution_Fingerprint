@@ -1,7 +1,9 @@
 package com.example.access_control_solution.ui
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -60,8 +62,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.bitel.api.Fingerprint
+import com.example.access_control_solution.FingerprintCaptureState
+import com.example.access_control_solution.TelpoFingerprintManager
 import com.example.access_control_solution.viewModel.CardReaderViewModel
 import com.example.neurotecsdklibrary.NeurotecLicenseHelper
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 
@@ -79,6 +85,13 @@ fun AddProfileScreen(
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var capturedFace by remember { mutableStateOf<Bitmap?>(null) }
     var capturedTemplate by remember { mutableStateOf<ByteArray?>(null) }
+
+    // Fingerprint state
+    var fingerprintTemplate by remember { mutableStateOf<ByteArray?>(null) }
+    var fingerprintBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isFingerprintSensorReady by remember { mutableStateOf(false) }
+
+
     var showSuccessDialog by remember { mutableStateOf(false) }
     var showDuplicateDialog by remember { mutableStateOf(false) }
     var duplicateMessage by remember { mutableStateOf("") }
@@ -89,15 +102,137 @@ fun AddProfileScreen(
     val cardData by viewModel.cardData.collectAsState()
     val cardReadError by viewModel.cardReadError.collectAsState()
 
-    val status by remember { derivedStateOf { viewModel.status } }
+    // Get biometrics from card tap
+    val faceImageFromCard by viewModel.faceImageFromCard.collectAsState()
+    val fingerprintsFromCard by viewModel.fingerprintFromCard.collectAsState()
 
-    // Update fields when card is tapped
+    val fpCaptureState by viewModel.fingerprintCaptureState.collectAsState()
+
+    // Auto-fill name+lagId from card
     LaunchedEffect(cardData) {
         cardData?.let { (fullName, lagIdFromCard) ->
             name = fullName
             lagId = lagIdFromCard
             // Clear card data after using it
             viewModel.clearCardData()
+        }
+    }
+
+    // Auto-fill face image from
+    LaunchedEffect(faceImageFromCard) {
+        faceImageFromCard?.let { bytes ->
+            // Detect image format by checking magic bytes
+            val isJpeg2000 = bytes.size > 12 &&
+                    bytes[0] == 0x00.toByte() && bytes[1] == 0x00.toByte() &&
+                    bytes[2] == 0x00.toByte() && bytes[3] == 0x0C.toByte() &&
+                    bytes[4] == 0x6A.toByte() && bytes[5] == 0x50.toByte()  // JP2 signature
+
+            val isJpeg = bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()
+
+            Log.d("AddProfileScreen", "Face image bytes: ${bytes.size}, isJPEG=$isJpeg, isJP2=$isJpeg2000")
+
+            // Try to decode with BitmapFactory first (handles JPEG, PNG, etc.)
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+
+            if (bmp != null) {
+                // BitmapFactory decoded it successfully — convert to standard JPEG for Neurotec
+                capturedFace = bmp
+                isProcessing = true
+
+                val jpegBytes = ByteArrayOutputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                    out.toByteArray()
+                }
+
+                viewModel.processFaceFromImage(
+                    imageBytes = jpegBytes,
+                    previewBitmap = bmp,
+                    onSuccess = { _, template ->
+                        capturedTemplate = template
+                        isProcessing = false
+                        errorMessage = ""
+                    },
+                    onError = { err ->
+                        isProcessing = false
+                        errorMessage = "Card face loaded but template extraction failed: $err"
+                    }
+                )
+            } else {
+
+                Log.w("AddProfileScreen", "BitmapFactory failed, trying JP2 extraction...")
+
+                val jpegStartIndex = bytes.indices.firstOrNull { i ->
+                    i + 1 < bytes.size &&
+                            bytes[i] == 0xFF.toByte() &&
+                            bytes[i + 1] == 0xD8.toByte()
+                }
+
+                if (jpegStartIndex != null) {
+                    val jpegBytes = bytes.copyOfRange(jpegStartIndex, bytes.size)
+                    val jpegBmp = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+
+                    if (jpegBmp != null) {
+                        capturedFace = jpegBmp
+                        isProcessing = true
+
+                        val reEncodedJpeg = ByteArrayOutputStream().use { out ->
+                            jpegBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                            out.toByteArray()
+                        }
+
+                        viewModel.processFaceFromImage(
+                            imageBytes = reEncodedJpeg,
+                            previewBitmap = jpegBmp,
+                            onSuccess = { _, template ->
+                                capturedTemplate = template
+                                isProcessing = false
+                                errorMessage = ""
+                            },
+                            onError = { err ->
+                                isProcessing = false
+                                errorMessage = "Card face loaded but template extraction failed: $err"
+                            }
+                        )
+                    } else {
+                        errorMessage = "Card face image format not supported"
+                    }
+                } else {
+                    errorMessage = "Card face image format not supported (not JPEG or JP2)"
+                }
+            }
+        }
+    }
+    // Auto-fill fingerprint from card
+    // Converts WSQ  to NTemplate before storing
+    LaunchedEffect(fingerprintsFromCard) {
+        if (fingerprintsFromCard.isNotEmpty()) {
+
+            val alreadyConverted = fingerprintsFromCard.firstOrNull { it.format == "NEUROTEC" }
+            if (alreadyConverted?.template != null) {
+                fingerprintTemplate = alreadyConverted.template
+                fingerprintBitmap = null
+                return@LaunchedEffect
+            }
+
+            // Fallback: raw WSQ still in list — convert now
+            // (handles case where extractAndStoreFingerprintFromCard hasn't finished yet)
+            val wsqFingers = fingerprintsFromCard.filter {
+                it.format == "WSQ" || it.format == "RAW"
+            }
+            if (wsqFingers.isEmpty()) return@LaunchedEffect
+
+            isProcessing = true
+            errorMessage = ""
+
+            viewModel.extractAndStoreFingerprintFromCard(wsqFingers) { template ->
+                isProcessing = false
+                if (template != null) {
+                    fingerprintTemplate = template
+                    fingerprintBitmap = null
+                } else {
+                    errorMessage = "Could not extract fingerprint template from card"
+                }
+            }
         }
     }
 
@@ -109,15 +244,37 @@ fun AddProfileScreen(
         }
     }
 
+    // Handle fingerprint capture state changes
+    LaunchedEffect(fpCaptureState) {
+        when(val state = fpCaptureState) {
+            is FingerprintCaptureState.Success -> {
+                fingerprintTemplate = state.template
+                fingerprintBitmap = state.image
+                errorMessage = ""
+            }
+            is FingerprintCaptureState.Failure -> {
+                errorMessage = state.message
+            }
+            else -> {}
+        }
+
+    }
+
+//    val status by remember { derivedStateOf { viewModel.status } }
+//
+//
     // Clean up when screen is first loaded
     LaunchedEffect(Unit) {
         viewModel.clearCapturedStaffFace()
         viewModel.stopCapture()
         viewModel.hideDialog()
+        viewModel.initializeForFingerprintOnly()
         viewModel.clearCardData() // Clear any previous card data
-        // Verify biometric client is initialized
-        if (viewModel.biometricClient == null) {
-            viewModel.initialize()
+        viewModel.resetFingerprintCapture()
+        // Open fingerprint sensor
+        viewModel.openFingerprintSensor { success ->
+            isFingerprintSensorReady = success
+            if (!success) errorMessage = "Fingerprint sensor unavailable"
         }
     }
 
@@ -127,6 +284,8 @@ fun AddProfileScreen(
             viewModel.stopCapture()
             viewModel.clearCapturedStaffFace()
             viewModel.clearCardData()
+            viewModel.resetFingerprintCapture()
+            viewModel.closeFingerprintSensor()
         }
     }
 
@@ -160,16 +319,7 @@ fun AddProfileScreen(
             )
         }
     }
-
-    LaunchedEffect(Unit) {
-        viewModel.clearCapturedStaffFace()
-        viewModel.stopCapture()
-        viewModel.hideDialog()
-        // Initialize client only
-        viewModel.initializeClientOnly()
-
-    }
-
+    
     Scaffold(
         topBar = {
             TopAppBar(
@@ -195,6 +345,43 @@ fun AddProfileScreen(
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+
+            // NFC hint card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD)),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "\uD83E\uDEAA",
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF2196F3)
+                    )
+                    Spacer(Modifier.width(16.dp))
+                    Text(
+                        "Tap your card to auto-fill your name, photo & fingerprint\nor fill in manually below",
+                        fontSize = 17.sp, color = Color(0xFF1976D2)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Face Photo
+            Text("Face Photo",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Gray,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             // Profile Picture Section
             Card(
                 modifier = Modifier
@@ -213,6 +400,13 @@ fun AddProfileScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     when {
+                        isProcessing -> {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(Modifier.size(48.dp), color = Color(0xFF00A86B))
+                                Spacer(Modifier.height(8.dp))
+                                Text("Processing...", fontSize = 12.sp, color = Color.Gray)
+                            }
+                        }
                         capturedFace != null -> {
                             Image(
                                 bitmap = capturedFace!!.asImageBitmap(),
@@ -220,39 +414,7 @@ fun AddProfileScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop
                             )
-
-                            if (isProcessing) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(Color.Black.copy(alpha = 0.5f)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(48.dp),
-                                        color = Color.White
-                                    )
-                                }
-                            }
                         }
-
-                        isProcessing -> {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(48.dp),
-                                    color = Color(0xFF00A86B)
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "Processing...",
-                                    fontSize = 12.sp,
-                                    color = Color.Gray
-                                )
-                            }
-                        }
-
                         else -> {
                             Column(
                                 horizontalAlignment = Alignment.CenterHorizontally
@@ -276,189 +438,217 @@ fun AddProfileScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Status Text
-            if (status.isNotEmpty()) {
-                Text(
-                    text = status,
-                    fontSize = 14.sp,
-                    color = when {
-                        status.contains("success", ignoreCase = true) -> Color(0xFF00A86B)
-                        status.contains("error", ignoreCase = true) ||
-                                status.contains("failed", ignoreCase = true) -> Color.Red
-                        else -> Color.Gray
-                    },
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(vertical = 8.dp)
-                )
+            if (capturedFace != null && !isProcessing) {
+                TextButton(onClick = {
+                    capturedFace = null; capturedTemplate = null; selectedImageUri = null; errorMessage = ""
+                    imagePickerLauncher.launch("image/*")
+                }, enabled = !isSaving) {
+                    Text("Change Photo", color = Color(0xFF2196F3), fontSize = 14.sp)
+                }
             }
 
-            // Change Photo Button
-            if (capturedFace != null && !isProcessing) {
-                TextButton(
-                    onClick = {
-                        capturedFace = null
-                        capturedTemplate = null
-                        selectedImageUri = null
-                        errorMessage = ""
-                        imagePickerLauncher.launch("image/*")
-                    },
-                    enabled = !isSaving
+            // Badge when face was auto-filled from card
+            if (faceImageFromCard != null && capturedFace != null) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.padding(top = 4.dp)
                 ) {
                     Text(
-                        text = "Change Photo",
-                        color = Color(0xFF2196F3),
-                        fontSize = 14.sp
+                        " Face loaded from card",
+                        fontSize = 12.sp, color = Color(0xFF2E7D32),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+            // Fingerprint Section
+            Text(
+                "Fingerprint",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Gray,
+                modifier = Modifier.fillMaxWidth()
+            )
 
-            // NFC Card Instructions
+            Spacer(Modifier.height(8.dp))
+
             Card(
                 modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFFE3F2FD)
+                    containerColor = when {
+                        fingerprintTemplate != null -> Color(0xFFE8F5E9)
+                        fpCaptureState is FingerprintCaptureState.WaitingForFinger -> Color(0xFFFFF8E1)
+                        fpCaptureState is FingerprintCaptureState.Failure -> Color(0xFFFFEBEE)
+                        else -> Color(0xFFF5F5F5)
+                    }
                 ),
-                shape = RoundedCornerShape(12.dp)
+                elevation = CardDefaults.cardElevation(2.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(
-                        text = "))))",
-                        fontSize = 32.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF2196F3)
-                    )
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Text(
-                        text = "Insert the image then tap your card to auto-fill details\nor enter manually below",
-                        fontSize = 14.sp,
-                        color = Color(0xFF1976D2)
-                    )
+                    when {
+                        fingerprintTemplate != null -> {
+                            // Enrolled — show success state
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("\uD83E\uDEC6", fontSize = 40.sp)
+                                Spacer(Modifier.width(12.dp))
+                                Column {
+                                    Text(
+                                        text = if (fingerprintsFromCard.isNotEmpty()) " Fingerprint from card"
+                                        else " Fingerprint enrolled",
+                                        fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF2E7D32)
+                                    )
+//                                    Text(
+//                                        "${fingerprintTemplate!!.size} bytes",
+//                                        fontSize = 12.sp, color = Color.Gray
+//                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(onClick = {
+                                fingerprintTemplate = null; fingerprintBitmap = null
+                                viewModel.resetFingerprintCapture()
+                            }) {
+                                Text("Clear & Re-capture", color = Color(0xFFE53935), fontSize = 13.sp)
+                            }
+                        }
+
+                        fpCaptureState is FingerprintCaptureState.WaitingForFinger -> {
+                            // Scanning in progress
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(Modifier.size(32.dp), color = Color(0xFFF57F17), strokeWidth = 3.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Text("Place finger on scanner…", fontSize = 15.sp, color = Color(0xFFF57F17))
+                            }
+                        }
+                        fpCaptureState is FingerprintCaptureState.Failure -> {
+                            Text("❌", fontSize = 32.sp)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                (fpCaptureState as FingerprintCaptureState.Failure).message,
+                                fontSize = 13.sp,
+                                color = Color(0xFFD32F2F),
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Button(
+                                onClick = {
+                                    viewModel.resetFingerprintCapture()
+                                    viewModel.captureFingerprintWithNeurotec { template ->
+                                        if (template != null) fingerprintTemplate = template
+                                    }
+                                },
+                                enabled = isFingerprintSensorReady && !isSaving,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00A86B)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Retry", fontSize = 14.sp)
+                            }
+                        }
+                        else -> {
+                            // Not yet enrolled
+//                            Text("👆", fontSize = 48.sp)
+//                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "No fingerprint enrolled\n(optional — tap card or scan manually)",
+                                fontSize = 13.sp, color = Color.Gray, textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            Button(
+                                onClick = {
+                                    if (isFingerprintSensorReady) viewModel.captureFingerprint()
+                                    else errorMessage = "Fingerprint sensor not available"
+                                },
+                                enabled = isFingerprintSensorReady && !isSaving,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00A86B)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Scan Fingerprint", fontSize = 14.sp)
+                            }
+                        }
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Staff Details Form
+
+            // Form fields
             OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                label = { Text("Full Name") },
-                placeholder = { Text("Enter full name") },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                singleLine = true,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = Color(0xFF00A86B),
-                    focusedLabelColor = Color(0xFF00A86B)
-                ),
+                value = name, onValueChange = { name = it },
+                label = { Text("Full Name") }, placeholder = { Text("Enter full name") },
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Color(0xFF00A86B), focusedLabelColor = Color(0xFF00A86B)),
                 enabled = !isProcessing && !isSaving
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(Modifier.height(16.dp))
 
             OutlinedTextField(
-                value = lagId,
-                onValueChange = { lagId = it },
-                label = { Text("LAG ID") },
-                placeholder = { Text("Enter LAG ID") },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                singleLine = true,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = Color(0xFF00A86B),
-                    focusedLabelColor = Color(0xFF00A86B)
-                ),
+                value = lagId, onValueChange = { lagId = it },
+                label = { Text("LAG ID") }, placeholder = { Text("Enter LAG ID") },
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Color(0xFF00A86B), focusedLabelColor = Color(0xFF00A86B)),
                 enabled = !isProcessing && !isSaving
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Error Message
+            // Error message
             if (errorMessage.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFFFFEBEE)
-                    ),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
                     shape = RoundedCornerShape(8.dp)
                 ) {
-                    Text(
-                        text = errorMessage,
-                        color = Color(0xFFD32F2F),
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(12.dp),
-                        textAlign = TextAlign.Center
-                    )
+                    Text(errorMessage, color = Color(0xFFD32F2F), fontSize = 14.sp,
+                        modifier = Modifier.padding(12.dp), textAlign = TextAlign.Center)
                 }
-                Spacer(modifier = Modifier.height(16.dp))
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(Modifier.height(24.dp))
 
             // Save Button
             Button(
                 onClick = {
-                    // Prevent multiple clicks
                     if (isSaving) return@Button
-
                     errorMessage = ""
-
                     when {
-                        name.isBlank() -> errorMessage = "Please enter name"
+                        name.isBlank()  -> errorMessage = "Please enter name"
                         lagId.isBlank() -> errorMessage = "Please enter LAG ID"
                         capturedFace == null || capturedTemplate == null ->
-                            errorMessage = "Please select a profile photo"
+                            errorMessage = "Please select or capture a face photo"
                         else -> {
                             isSaving = true
-
-                            // Convert bitmap to bytes
-                            val imageBytes = capturedFace?.let { bitmap ->
-                                val stream = java.io.ByteArrayOutputStream()
-                                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, stream)
-                                stream.toByteArray()
+                            Log.d("AddProfileScreen", "Saving profile - fingerprintTemplate: ${fingerprintTemplate?.size ?: "NULL"}")
+                            val imageBytes = run {
+                                val s = java.io.ByteArrayOutputStream()
+                                capturedFace!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, s)
+                                s.toByteArray()
                             }
-
-                            if (imageBytes != null && capturedTemplate != null) {
-                                viewModel.saveProfile(
-                                    name = name.trim(),
-                                    lagId = lagId.trim(),
-                                    faceTemplate = capturedTemplate!!,
-                                    faceImage = imageBytes,
-                                    onSuccess = {
-                                        isSaving = false
-                                        showSuccessDialog = true
-                                    },
-                                    onError = { error ->
-                                        isSaving = false
-                                        // Check if it's a duplicate error
-                                        if (error.contains("already registered", ignoreCase = true)) {
-                                            duplicateMessage = error
-                                            showDuplicateDialog = true
-                                        } else {
-                                            errorMessage = "Error: $error"
-                                        }
-
-                                    }
-                                )
-                            } else {
-                                isSaving = false
-                                errorMessage = "Missing face data"
-                            }
+                            viewModel.saveProfile(
+                                name = name.trim(),
+                                lagId = lagId.trim(),
+                                faceTemplate = capturedTemplate!!,
+                                faceImage = imageBytes,
+                                fingerprintTemplate = fingerprintTemplate,
+                                onSuccess = { isSaving = false; showSuccessDialog = true },
+                                onError = { err ->
+                                    isSaving = false
+                                    if (err.contains("already registered", ignoreCase = true)) {
+                                        duplicateMessage = err; showDuplicateDialog = true
+                                    } else errorMessage = "Error: $err"
+                                }
+                            )
                         }
                     }
                 },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
+                modifier = Modifier.fillMaxWidth().height(56.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(0xFF00A86B),
                     disabledContainerColor = Color.Gray
@@ -469,123 +659,64 @@ fun AddProfileScreen(
                         !isProcessing && !isSaving
             ) {
                 if (isSaving) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(24.dp),
-                        color = Color.White,
-                        strokeWidth = 2.dp
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text("Saving...")
+                    CircularProgressIndicator(Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp)); Text("Saving…")
                 } else {
-                    Text(
-                        text = "Save Profile",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Text("Save Profile", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 }
+            }
+
+            // Duplicate dialog
+            if (showDuplicateDialog) {
+                AlertDialog(
+                    onDismissRequest = { showDuplicateDialog = false },
+                    title = {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                            Text("⚠️", fontSize = 48.sp); Spacer(Modifier.height(8.dp))
+                            Text("Duplicate Profile", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFF9800))
+                        }
+                    },
+                    text = { Text(duplicateMessage, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()) },
+                    confirmButton = {
+                        TextButton(onClick = { showDuplicateDialog = false; duplicateMessage = "" }) {
+                            Text("OK", color = Color(0xFF00A86B))
+                        }
+                    }
+                )
+            }
+
+            // Success dialog
+            if (showSuccessDialog) {
+                AlertDialog(
+                    onDismissRequest = { },
+                    title = {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF00A86B), modifier = Modifier.size(64.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text("Success!", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    text = {
+                        Text("Profile for $name has been added.", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showSuccessDialog = false; onProfileAdded() }) {
+                            Text("View All Profiles", color = Color(0xFF00A86B))
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = {
+                            showSuccessDialog = false
+                            name = ""; lagId = ""; capturedFace = null; capturedTemplate = null
+                            selectedImageUri = null; fingerprintTemplate = null; fingerprintBitmap = null
+                            errorMessage = ""; isSaving = false
+//                            viewModel.resetFingerprintCapture()
+                        }) {
+                            Text("Add Another", color = Color(0xFF2196F3))
+                        }
+                    }
+                )
             }
         }
-    }
-
-    // Duplicate dialog
-    if (showDuplicateDialog) {
-        AlertDialog(
-            onDismissRequest = { showDuplicateDialog = false },
-            title = {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "⚠️",
-                        fontSize = 48.sp
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Duplicate Profile",
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFFF9800)
-                    )
-                }
-            },
-             text = {
-                 Text(
-                     text = duplicateMessage,
-                     textAlign = TextAlign.Center,
-                     modifier = Modifier.fillMaxWidth()
-                 )
-             },
-             confirmButton = {
-                 TextButton(
-                     onClick = {
-                         showDuplicateDialog = false
-                         duplicateMessage = ""
-                     }
-                 ) {
-                     Text("OK", color = Color(0xFF00A86B))
-                 }
-             }
-        )
-    }
-
-    // Success Dialog
-    if (showSuccessDialog) {
-        AlertDialog(
-            onDismissRequest = { },
-            title = {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = "Success",
-                        tint = Color(0xFF00A86B),
-                        modifier = Modifier.size(64.dp)
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Success!",
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            },
-            text = {
-                Text(
-                    text = "Profile for $name has been added successfully.",
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showSuccessDialog = false
-                        onProfileAdded()
-                    }
-                ) {
-                    Text("View All Profiles", color = Color(0xFF00A86B))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showSuccessDialog = false
-                        // Reset form
-                        name = ""
-                        lagId = ""
-                        capturedFace = null
-                        capturedTemplate = null
-                        selectedImageUri = null
-                        errorMessage = ""
-                        isSaving = false
-                    }
-                ) {
-                    Text("Add Another", color = Color(0xFF2196F3))
-                }
-            }
-        )
     }
 }

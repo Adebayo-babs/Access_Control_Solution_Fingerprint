@@ -12,6 +12,9 @@ interface ProfileDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun insert(staff: ProfileEntity): Long
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(profiles: List<ProfileEntity>)
+
     @Update
     fun update(staff: ProfileEntity)
 

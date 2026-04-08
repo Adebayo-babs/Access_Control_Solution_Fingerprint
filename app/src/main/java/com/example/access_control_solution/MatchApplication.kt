@@ -19,6 +19,9 @@ class MatchApplication : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        System.setProperty("neurotec.plugin.fingers.disable", "true")
+        System.setProperty("neurotec.plugin.fingers.zkteco.disable", "true")
+
         try {
             NLicenseManager.setTrialMode(true)
             Log.d("NeurotecLicense", "Trial mode enabled")

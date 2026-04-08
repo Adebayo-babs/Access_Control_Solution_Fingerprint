@@ -14,33 +14,42 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.access_control_solution.CaptureResult
+import com.example.access_control_solution.FingerprintCaptureState
+import com.example.access_control_solution.FingerprintVerifyState
+import com.example.access_control_solution.TelpoFingerprintManager
 import com.example.access_control_solution.api_models.AccessLog
 import com.example.access_control_solution.api_models.ClockRequest
 import com.example.access_control_solution.api_models.ProfileSyncManager
 import com.example.access_control_solution.api_models.RetrofitClient
 import com.example.access_control_solution.data.AppDatabase
 import com.example.access_control_solution.data.ProfileEntity
+import com.example.access_control_solution.reader.SAMCardReader
+import com.example.neurotecsdklibrary.NeurotecFingerprintHelper
 import com.example.neurotecsdklibrary.NeurotecLicenseHelper
 import com.neurotec.biometrics.NBiometricCaptureOption
 import com.neurotec.biometrics.NBiometricOperation
 import com.neurotec.biometrics.NBiometricStatus
 import com.neurotec.biometrics.NFace
+import com.neurotec.biometrics.NFinger
 import com.neurotec.biometrics.NSubject
 import com.neurotec.biometrics.client.NBiometricClient
 import com.neurotec.devices.NCamera
 import com.neurotec.devices.NDeviceType
 import com.neurotec.images.NImage
+import com.neurotec.images.NImageFormat
 import com.neurotec.io.NBuffer
+import com.neurotec.lang.NCore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import okhttp3.internal.http2.Settings
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.lang.Error
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -57,37 +66,27 @@ data class FaceDetectionFeedback(
     val overallMessage: String = "Position your face in view"
 )
 
-enum class LightingStatus {
-    GOOD, UNKNOWN
-}
+enum class LightingStatus { GOOD, UNKNOWN }
 
-enum class DistanceStatus {
-    GOOD, UNKNOWN
-}
+enum class DistanceStatus { GOOD, UNKNOWN }
 
-enum class PositionStatus {
-    CENTERED, UNKNOWN
-}
+enum class PositionStatus { CENTERED, UNKNOWN }
 
-enum class QualityStatus {
-    EXCELLENT, UNKNOWN
-}
+enum class QualityStatus { EXCELLENT, UNKNOWN }
 
 class CardReaderViewModel(application: Application) : AndroidViewModel(application) {
+
     data class DialogState(
         val showDialog: Boolean = false,
         val message: String = "",
         val capturedFace: Bitmap? = null
     )
 
-    // Private mutable state - only this viewModel can change it
     private val _dialogState = MutableStateFlow(DialogState())
-    // Public read-only state - UI can observe but not modify
     val dialogState: StateFlow<DialogState> = _dialogState.asStateFlow()
 
     private val main = android.os.Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
-
     private val dbExecutor = Executors.newSingleThreadExecutor()
 
     var status by mutableStateOf("")
@@ -108,58 +107,100 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     var useNeurotecCamera by mutableStateOf(true)
         private set
 
-    // Callback property for sound
     var onFaceDetectedSound: (() -> Unit)? = null
 
-    // Card data state for AddProfileScreen
+    // Card data state
     private val _cardData = MutableStateFlow<Pair<String, String>?>(null)
     val cardData: StateFlow<Pair<String, String>?> = _cardData.asStateFlow()
 
     private val _cardReadError = MutableStateFlow<String?>(null)
     val cardReadError: StateFlow<String?> = _cardReadError.asStateFlow()
 
+    private val _faceImageFromCard = MutableStateFlow<ByteArray?>(null)
+    val faceImageFromCard: StateFlow<ByteArray?> = _faceImageFromCard.asStateFlow()
+
+    // Fingerprint states
+
+    private val _fingerprintsFromCard =
+        MutableStateFlow<List<SAMCardReader.FingerprintData>>(emptyList())
+    val fingerprintFromCard: StateFlow<List<SAMCardReader.FingerprintData>> =
+        _fingerprintsFromCard.asStateFlow()
+
+    private val _fingerprintCaptureState =
+        MutableStateFlow<FingerprintCaptureState>(
+            FingerprintCaptureState.Idle
+        )
+    val fingerprintCaptureState: StateFlow<FingerprintCaptureState> =
+        _fingerprintCaptureState.asStateFlow()
+
+    private val _fingerprintVerifyState =
+        MutableStateFlow<FingerprintVerifyState>(
+            FingerprintVerifyState.Idle
+        )
+    val fingerprintVerifyState: StateFlow<FingerprintVerifyState> =
+        _fingerprintVerifyState.asStateFlow()
+
+    private var fpManager: TelpoFingerprintManager? = null
+
+
     private val cameras = mutableListOf<NCamera>()
     private var activeCameraIndex = 0
-
     private var isInitialized = false
-
     private var captureInProgress = false
-
 
     var capturedProfileFace: Bitmap? by mutableStateOf(null)
         private set
-
     var capturedProfileTemplate: ByteArray? = null
         private set
 
     private var cachedProfiles: List<ProfileEntity>? = null
     private var cacheTimestamp: Long = 0
-    private val CACHE_DURATION_MS = 30000L  // 30 seconds cache
+    private val CACHE_DURATION_MS = 30000L
 
     private lateinit var syncManager: ProfileSyncManager
     var isServerAvailable by mutableStateOf(false)
     private var isSyncing by mutableStateOf(false)
 
+    private var isSensorOpen = false
+    private val sensorLock = Any()
+
+    private var isCameraClientInitialized = false
+
+    // Biometric data from card
+
+    fun setBiometricDataFromCard(faceImage: ByteArray?) {
+        _faceImageFromCard.value = faceImage
+    }
+
+    fun setFingerprintsFromCard(fingerprints: List<SAMCardReader.FingerprintData>) {
+        _fingerprintsFromCard.value = fingerprints
+    }
+
+
+    // Initialization
     fun initialize() {
-        if (isInitialized) {
+        if (isCameraClientInitialized && isInitialized) {
             startAutomaticCapture()
             return
         }
-
+        // If client exists but is fingerprint-only, dispose it cleanly
+        if (biometricClient != null && !isCameraClientInitialized) {
+            biometricClient?.dispose()
+            biometricClient = null
+            isInitialized = false
+        }
         executor.execute {
             try {
                 NeurotecLicenseHelper.obtainFaceLicenses(getApplication())
                 initClient()
-                main.post {
-                    if (isInitialized) {
-                        startAutomaticCapture()
-                    }
-                }
+//                main.post { if (isInitialized) startAutomaticCapture() }
             } catch (e: Exception) {
                 main.post { status = "License Error: ${e.message}" }
             }
         }
     }
+
+
 
     private fun initClient() {
         try {
@@ -208,461 +249,581 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    // Initialize client without starting capture
-    fun initializeClientOnly() {
+    fun initializeForFingerprintOnly() {
         if (biometricClient != null) {
-            return // Already initialized
+            return
         }
-
         executor.execute {
             try {
                 NeurotecLicenseHelper.obtainFaceLicenses(getApplication())
-                initClient()
+                // Initialize without device manager to avoid ZKTeco plugin crash
+                biometricClient = NBiometricClient().apply {
+                    setFacesDetectProperties(true)
+                    facesQualityThreshold = 50
+                    facesConfidenceThreshold = 1
+                    setProperty("Faces.DetectAllFeaturePoints", "false")
+                    setProperty("Faces.RecognizeExpression", "false")
+                    initialize()
+                }
                 isInitialized = true
+                isCameraClientInitialized = false
             } catch (e: Exception) {
-                main.post { status = "License Error: ${e.message}"}
+                main.post { status = "License Error: ${e.message}" }
             }
         }
     }
 
     fun initializeSyncManager() {
         syncManager = ProfileSyncManager(getApplication())
-        // Check server availability on startup
         executor.execute {
             CoroutineScope(Dispatchers.IO).launch {
                 isServerAvailable = syncManager.isServerAvailable()
-
-                if (isServerAvailable) {
-                    // Automatically load profiles from server on startup
-                    loadProfilesFromServer()
-                } else {
-                    Log.w("CardReaderViewModel", "Server not available, using local database only")
-                }
+                if (isServerAvailable) loadProfilesFromServer()
+                else Log.w("CardReaderViewModel", "Server not available, using local database only")
             }
         }
-
     }
 
     private fun loadProfilesFromServer() {
-        if (isSyncing) {
-            return
-        }
-
+        if (isSyncing) return
         isSyncing = true
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val result = syncManager.loadAllProfilesFromServer()
-
                 main.post {
                     isSyncing = false
-                    if (result.isSuccess) {
-                        val count = result.getOrDefault(0)
-                        Log.d("CardReaderViewModel", "Successfully loaded $count profiles")
-
-                        // Invalidate cache
-                        cachedProfiles = null
-                    } else {
-                        Log.e("CardReaderViewModel", "Failed to load profiles: ${result.exceptionOrNull()}")
-                    }
+                    if (result.isSuccess) cachedProfiles = null
+                    else Log.e("CardReaderViewModel", "Failed to load profiles: ${result.exceptionOrNull()}")
                 }
             } catch (e: Exception) {
                 Log.e("CardReaderViewModel", "Error loading profiles", e)
-                main.post {
-                    isSyncing = false
-                }
+                main.post { isSyncing = false }
             }
         }
     }
 
     fun setCardDataForProfile(fullName: String, lagId: String) {
-        main.post {
-            _cardData.value = Pair(fullName, lagId)
-            _cardReadError.value = null
-        }
+        main.post { _cardData.value = Pair(fullName, lagId); _cardReadError.value = null }
     }
 
-    fun setCardReadError(error: String) {
-        _cardReadError.value = error
-    }
+    fun setCardReadError(error: String) { _cardReadError.value = error }
+    fun clearCardData() { _cardData.value = null; _cardReadError.value = null }
 
-    fun clearCardData() {
-        _cardData.value = null
-        _cardReadError.value = null
-    }
 
     fun startAutomaticCapture() {
-
         if (captureInProgress || !isInitialized) {
             Log.d("CardReaderViewModel", "Capture already in progress or not initialized")
             return
         }
 
         executor.execute {
+            var subject: NSubject? = null
+            var task: com.neurotec.biometrics.NBiometricTask? = null
             try {
                 captureInProgress = true
                 main.post {
                     isCapturing = true
-                    detectionFeedback = FaceDetectionFeedback(
-                        overallMessage = "Looking for face..."
-                    )
+                    detectionFeedback = FaceDetectionFeedback(overallMessage = "Looking for face...")
                 }
 
-                Log.d("CardReaderViewModel", "Starting automatic capture...")
+                val client = biometricClient ?: run {
+                    captureInProgress = false
+                    return@execute
+                }
 
-                val subject = NSubject()
+                subject = NSubject()
                 val face = NFace().apply {
                     captureOptions = EnumSet.of(NBiometricCaptureOption.STREAM)
                 }
-
                 subject.faces.add(face)
-                main.post { currentSubject = subject }
 
-                val task = biometricClient?.createTask(
+                // Guard: if stopCapture() was called while setting up, abort cleanly
+                if (!captureInProgress) {
+                    subject.dispose()
+                    return@execute
+                }
+
+                task = client.createTask(
                     EnumSet.of(NBiometricOperation.CAPTURE, NBiometricOperation.CREATE_TEMPLATE),
                     subject
                 )
 
-                task?.let { biometricClient?.performTask(it) }
+                // Expose subject ONLY so UI can read it if needed — never mutate it from main thread
+                currentSubject = subject
 
-                val taskStatus = task?.status
+                // This blocks until capture completes or cancel() is called
+                client.performTask(task)
 
+                // Clear reference now that performTask has returned
+                currentSubject = null
+
+                val taskStatus = task.status
                 Log.d("CardReaderViewModel", "Capture task status: $taskStatus")
 
                 when (taskStatus) {
                     NBiometricStatus.OK -> {
-                        Log.d("CardReaderViewModel", "Face captured successfully!")
-
-                        // Extract face image
-                        val faceImage = subject.faces.firstOrNull()?.image
-                        val bitmap = faceImage?.let { convertNImageToBitmap(it) }
-
-                        // Extract and store the template for verification
+                        val bitmap = subject.faces.firstOrNull()?.image
+                            ?.let { convertNImageToBitmap(it) }
                         val template = subject.templateBuffer?.toByteArray()
                         if (template != null) {
                             capturedProfileFace = bitmap
                             capturedProfileTemplate = template
-                            Log.d("CardReaderViewModel", "Template saved for verification, size: ${template.size}")
+                            Log.d("CardReaderViewModel", "Template saved: ${template.size} bytes")
                         } else {
                             Log.e("CardReaderViewModel", "Failed to extract template!")
                         }
-
                         main.post {
                             onFaceDetectedSound?.invoke()
-//                            status = "Face captured successfully!"
                             detectionFeedback = FaceDetectionFeedback(
-                                lightingStatus = LightingStatus.GOOD,
-                                distanceStatus = DistanceStatus.GOOD,
-                                positionStatus = PositionStatus.CENTERED,
-                                qualityStatus = QualityStatus.EXCELLENT,
-                                overallMessage = "Perfect! Face captured!"
+                                LightingStatus.GOOD, DistanceStatus.GOOD,
+                                PositionStatus.CENTERED, QualityStatus.EXCELLENT,
+                                "Perfect! Face captured!"
                             )
-
-                            // Show dialog with captured face
                             showFaceDetectedDialog(bitmap)
                         }
-
-                        captureInProgress
+                        // captureInProgress stays true — capture is done, not retrying
                     }
 
-                    NBiometricStatus.TIMEOUT,
-                    NBiometricStatus.BAD_OBJECT -> {
-                        Log.w("CardReaderViewModel", "No face detected, retrying...")
+                    NBiometricStatus.TIMEOUT, NBiometricStatus.BAD_OBJECT -> {
                         main.post {
                             status = "No face detected. Please position your face..."
                             detectionFeedback = FaceDetectionFeedback(
                                 overallMessage = "No face detected. Please try again..."
                             )
                         }
-
                         captureInProgress = false
                         main.postDelayed({ startAutomaticCapture() }, 500)
                     }
 
                     else -> {
-                        Log.w("CardReaderViewModel", "Capture failed: $taskStatus")
-                        main.post {
-                            detectionFeedback = FaceDetectionFeedback(
-                                overallMessage = "Detection failed. Retrying..."
-                            )
-                        }
-
+                        Log.w("CardReaderViewModel", "Capture failed or cancelled: $taskStatus")
                         captureInProgress = false
-                        main.postDelayed({ startAutomaticCapture() }, 800)
+                        // Only retry if we weren't deliberately stopped
+                        if (isInitialized) {
+                            main.post {
+                                detectionFeedback = FaceDetectionFeedback(
+                                    overallMessage = "Detection failed. Retrying..."
+                                )
+                            }
+                            main.postDelayed({ startAutomaticCapture() }, 800)
+                        }
                     }
                 }
 
-                task?.dispose()
-
             } catch (e: Exception) {
                 Log.e("CardReaderViewModel", "Error during capture", e)
+                currentSubject = null
                 captureInProgress = false
                 main.post {
                     isCapturing = false
-//                    status = "Capture error. Retrying..."
-                    detectionFeedback = FaceDetectionFeedback(
-                        overallMessage = "Error occurred. Retrying..."
-                    )
+                    detectionFeedback = FaceDetectionFeedback(overallMessage = "Error occurred. Retrying...")
+                }
+                if (isInitialized) {
                     main.postDelayed({ startAutomaticCapture() }, 1000)
                 }
+            } finally {
+                currentSubject = null
+                try { task?.dispose() } catch (_: Exception) {}
+                try { subject?.dispose() } catch (_: Exception) {}
             }
         }
     }
 
     private fun convertNImageToBitmap(nImage: NImage): Bitmap? {
-        return try {
-            val bitmap = nImage.toBitmap()
-            Log.d("CardReaderViewModel", "Converted to bitmap: ${bitmap.width}x${bitmap.height}")
-            bitmap
-        } catch (e: Exception) {
-            Log.e("CardReaderViewModel", "Error converting NImage to Bitmap", e)
-            null
-        }
+        return try { nImage.toBitmap() } catch (e: Exception) { null }
     }
-
 
     fun toggleCameraPreview() {
-        if (cameras.size < 2) {
-            status = "Only one camera available"
-            return
+        if (cameras.size < 2) { status = "Only one camera available"; return }
+
+        isCapturing = false
+        captureInProgress = false
+
+        try { biometricClient?.cancel() } catch (e: Exception) {
+            Log.e("CardReaderViewModel", "Cancel error", e)
         }
-        stopCapture()
-        activeCameraIndex = (activeCameraIndex + 1) % cameras.size
-        biometricClient?.faceCaptureDevice = cameras[activeCameraIndex]
-        status = "Switched to ${cameras[activeCameraIndex].displayName}"
-        startAutomaticCapture()
+
+        executor.execute {
+            activeCameraIndex = (activeCameraIndex + 1) % cameras.size
+            biometricClient?.faceCaptureDevice = cameras[activeCameraIndex]
+            main.post {
+                status = "Camera switched"
+                startAutomaticCapture()
+            }
+        }
     }
+
 
     fun stopCapture() {
         captureInProgress = false
         isCapturing = false
-
-        // Cancel any pending capture operations
         try {
-            currentSubject?.faces?.clear()
-            currentSubject = null
-        } catch (e: Exception) {
+            biometricClient?.cancel()
+//            currentSubject?.faces?.clear()
+//            currentSubject = null
+        }
+        catch (e: Exception) {
             Log.e("CardReaderViewModel", "Error clearing subject", e)
         }
     }
 
     private fun showFaceDetectedDialog(faceBitmap: Bitmap?) {
-        _dialogState.value = DialogState(
-            showDialog = true,
-            message = "Face Detected Successfully",
-            capturedFace = faceBitmap
-        )
+        _dialogState.value = DialogState(showDialog = true, message = "Face Detected Successfully", capturedFace = faceBitmap)
     }
 
-    fun hideDialog() {
-        _dialogState.value = DialogState(
-            showDialog = false,
-            message = "",
-            capturedFace = null
-        )
-    }
+    fun hideDialog() { _dialogState.value = DialogState() }
 
     fun reset() {
         stopCapture()
         hideDialog()
         status = ""
         detectionFeedback = FaceDetectionFeedback()
-        isInitialized = false
+        _faceImageFromCard.value = null
+        currentSubject = null
     }
+
+    // Fingerprint sensor
+
+    fun openFingerprintSensor(onResult: (Boolean) -> Unit) {
+
+        synchronized(sensorLock) {
+            if (isSensorOpen) {
+                main.post { onResult(true)}
+                return
+            }
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                synchronized(sensorLock) {
+                    if (isSensorOpen) {
+                        main.post { onResult(true)}
+                        return@launch
+                    }
+                }
+                if (fpManager == null) {
+                    fpManager = TelpoFingerprintManager(getApplication())
+                }
+                val ok = fpManager!!.open()
+
+                synchronized(sensorLock) {
+                    isSensorOpen = ok
+                    if (!ok) {
+                        fpManager = null
+                    }
+                }
+                main.post { onResult(ok) }
+            } catch (e: Exception) {
+                synchronized(sensorLock) {
+                    isSensorOpen = false
+                    fpManager = null
+                }
+                main.post { onResult(false) }
+            }
+        }
+    }
+
+    fun closeFingerprintSensor() {
+        val wasOpen: Boolean
+        synchronized(sensorLock) {
+            wasOpen = isSensorOpen
+            if (!isSensorOpen) return
+            isSensorOpen = false
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                fpManager?.close()
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "closeFingerprintSensor error", e)
+            } finally {
+                fpManager = null
+            }
+        }
+    }
+
+    fun extractAndStoreFingerprintFromCard(
+        fingerprints: List<SAMCardReader.FingerprintData>,
+        onReady: (ByteArray?) -> Unit
+    ) {
+        val wsqList = fingerprints.mapNotNull { fp ->
+            fp.template?.takeIf { fp.format == "WSQ" || fp.format == "RAW" }
+        }
+
+        if (wsqList.isEmpty()) {
+            Log.w("CardReaderViewModel", "No WSQ fingerprints found on card")
+            onReady(null)
+            return
+        }
+
+        val client = biometricClient ?: run {
+            Log.e("CardReaderViewModel", "Biometric client not ready")
+            onReady(null)
+            return
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val subject = NSubject()
+                var loadedCount = 0
+
+                wsqList.forEach { wsq ->
+                    try {
+                        NImage.fromMemory(NBuffer.fromArray(wsq), NImageFormat.getWSQ())?.let { img ->
+                            subject.fingers.add(NFinger().also { it.image = img })
+                            loadedCount++
+                        }
+                    } catch (e: Exception) {
+                        Log.w("CardReaderViewModel", "WSQ decode error: ${e.message}")
+                    }
+                }
+
+                if (loadedCount == 0) {
+                    Log.e("CardReaderViewModel", "No WSQ images could be decoded")
+                    main.post { onReady(null) }
+                    subject.dispose()
+                    return@launch
+                }
+
+                val status = client.createTemplate(subject)
+                if (status != NBiometricStatus.OK) {
+                    Log.e("CardReaderViewModel", "createTemplate failed: $status")
+                    main.post { onReady(null) }
+                    subject.dispose()
+                    return@launch
+                }
+
+                val templateBytes = subject.templateBuffer?.toByteArray()
+                Log.d("CardReaderViewModel",
+                    "Card fingerprint template created: ${templateBytes?.size} bytes " +
+                            "from $loadedCount finger(s)")
+
+                subject.dispose()
+                main.post { onReady(templateBytes) }
+
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "extractAndStoreFingerprintFromCard error", e)
+                main.post { onReady(null) }
+            }
+        }
+    }
+
+
+    fun captureFingerprint() {
+        _fingerprintCaptureState.value = FingerprintCaptureState.WaitingForFinger
+        CoroutineScope(Dispatchers.IO).launch {
+            val mgr = fpManager ?: run {
+                main.post { _fingerprintCaptureState.value = FingerprintCaptureState.Failure("Sensor not initialised") }
+                return@launch
+            }
+            when (val r = mgr.capture()) {
+                is CaptureResult.Success ->
+                    main.post { _fingerprintCaptureState.value = FingerprintCaptureState.Success(r.template, r.image) }
+                is CaptureResult.Failure ->
+                    main.post { _fingerprintCaptureState.value = FingerprintCaptureState.Failure(r.message) }
+                CaptureResult.Timeout ->
+                    main.post { _fingerprintCaptureState.value = FingerprintCaptureState.Failure("No finger detected. Please try again.") }
+            }
+        }
+    }
+
+    fun captureFingerprintWithNeurotec(onResult: (ByteArray?) -> Unit) {
+        _fingerprintCaptureState.value = FingerprintCaptureState.WaitingForFinger
+        CoroutineScope(Dispatchers.IO).launch {
+            val mgr = fpManager ?: run {
+                main.post {
+                    _fingerprintCaptureState.value = FingerprintCaptureState.Failure("Sensor not initialised")
+                    onResult(null)
+                }
+                return@launch
+            }
+
+            // Capture from BioMini
+            when (val r = mgr.capture()) {
+                is CaptureResult.Success -> {
+                    // Get BMP image bytes from scanner
+                    val bmpBytes = mgr.getCapturedImageBmp()
+                    if (bmpBytes == null) {
+                        main.post {
+                            _fingerprintCaptureState.value = FingerprintCaptureState.Failure("Failed to get image from scanner")
+                            onResult(null)
+                        }
+                        return@launch
+                    }
+                    // Extract Neurotec template from image
+                    val neurotecTemplate = NeurotecFingerprintHelper.extractTemplateFromImage(
+                        getApplication(), bmpBytes
+                    )
+                    main.post {
+                        if (neurotecTemplate != null) {
+                            _fingerprintCaptureState.value = FingerprintCaptureState.Success(neurotecTemplate, r.image)
+                            onResult(neurotecTemplate)
+                        } else {
+                            _fingerprintCaptureState.value = FingerprintCaptureState.Failure("Failed to extract fingerprint template")
+                            onResult(null)
+                        }
+                    }
+                }
+                is CaptureResult.Failure -> main.post {
+                    _fingerprintCaptureState.value = FingerprintCaptureState.Failure(r.message)
+                    onResult(null)
+                }
+                CaptureResult.Timeout -> main.post {
+                    _fingerprintCaptureState.value = FingerprintCaptureState.Failure("No finger detected. Please try again.")
+                    onResult(null)
+                }
+            }
+        }
+    }
+
+    fun resetFingerprintCapture() {
+        _fingerprintCaptureState.value = FingerprintCaptureState.Idle
+    }
+
+    fun scanAndIdentifyFingerprint() {
+        _fingerprintVerifyState.value = FingerprintVerifyState.Scanning
+        CoroutineScope(Dispatchers.IO).launch {
+            val mgr = fpManager ?: run {
+                main.post { _fingerprintVerifyState.value = FingerprintVerifyState.Error("Sensor not initialised") }
+                return@launch
+            }
+            val capture = mgr.capture()
+            if (capture !is CaptureResult.Success) {
+                val msg = when (capture) {
+                    is CaptureResult.Failure -> capture.message
+                    CaptureResult.Timeout -> "No finger detected. Try again."
+                    else -> "Capture failed"
+                }
+                main.post { _fingerprintVerifyState.value = FingerprintVerifyState.Error(msg) }
+                return@launch
+            }
+            val probe = capture.template
+            val profiles = AppDatabase.getInstance(getApplication()).profileDao().getAllProfile()
+                .filter { it.fingerprintTemplate != null }
+            if (profiles.isEmpty()) {
+                main.post { _fingerprintVerifyState.value = FingerprintVerifyState.Error("No enrolled fingerprints in database") }
+                return@launch
+            }
+            val result = mgr.identify(probe, profiles.map { it.fingerprintTemplate!! })
+            main.post {
+                if (result != null) {
+                    val (idx, _) = result   // verify() returns Boolean — no score to surface
+                    val profile = profiles[idx]
+                    _fingerprintVerifyState.value = FingerprintVerifyState.Matched(profile)
+                    logAccessAttempt(lagId = profile.lagId, name = profile.name, accessGranted = true, accessType = "FINGERPRINT")
+                    clockInOut(profile.lagId, profile.name, action = null) { _, msg ->
+                        Log.d("CardReaderViewModel", "Auto clock-in: $msg")
+                    }
+                } else {
+                    logAccessAttempt(lagId = "UNKNOWN", name = "Unknown", accessGranted = false, accessType = "FINGERPRINT")
+                    _fingerprintVerifyState.value = FingerprintVerifyState.NoMatch
+                }
+            }
+        }
+    }
+
+    fun resetFingerprintVerify() {
+        _fingerprintVerifyState.value = FingerprintVerifyState.Idle
+    }
+
+    // Save profile
 
     fun saveProfile(
         name: String,
         lagId: String,
         faceTemplate: ByteArray,
         faceImage: ByteArray,
+        fingerprintTemplate: ByteArray? = null,
         onSuccess: (Long) -> Unit,
         onError: (String) -> Unit
     ) {
         dbExecutor.execute {
             try {
+                Log.d("CardReaderViewModel", "saveProfile called - fingerprintTemplate: ${fingerprintTemplate?.size ?: "NULL"}")
                 val compressedImage = compressFaceImage(faceImage)
                 val thumbnail = createThumbnail(faceImage)
-
                 val profileEntity = ProfileEntity(
-                    name = name,
-                    lagId = lagId,
-                    faceTemplate = faceTemplate,
-                    faceImage = compressedImage,
-                    thumbnail = thumbnail
+                    name = name, lagId = lagId,
+                    faceTemplate = faceTemplate, faceImage = compressedImage,
+                    thumbnail = thumbnail, fingerprintTemplate = fingerprintTemplate
                 )
-
-                // Check for duplicates
                 checkForDuplicatesLocally(lagId, faceTemplate) { isDuplicate, duplicateType, existingProfile ->
                     if (isDuplicate) {
                         val errorMsg = when (duplicateType) {
                             "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
-                            "Face" -> "This face is already registered as ${existingProfile?.name}"
-                            else -> "Profile already exists"
+                            "Face"   -> "This face is already registered as ${existingProfile?.name}"
+                            else     -> "Profile already exists"
                         }
-                        Log.w("CardReaderViewModel", "✗ Local duplicate found: $errorMsg")
                         main.post { onError(errorMsg) }
                         return@checkForDuplicatesLocally
                     }
-
-                    Log.d("CardReaderViewModel", "✓ No local duplicates found")
-
-                    // If server is available, try to save to server
                     if (isServerAvailable) {
-                        Log.d("CardReaderViewModel", "Step 2: Saving to server...")
-
                         CoroutineScope(Dispatchers.IO).launch {
                             val serverResult = syncManager.saveProfileToServer(profileEntity)
-
                             if (serverResult.isSuccess) {
-                                Log.d("CardReaderViewModel", "✓ Server save successful")
-
-                                // Save locally after server confirms no duplicates
                                 try {
-                                    val profileId = AppDatabase.getInstance(getApplication())
-                                        .profileDao()
-                                        .insert(profileEntity)
-
-                                    cachedProfiles = null
-                                    cacheTimestamp = 0
-
+                                    val profileId = AppDatabase.getInstance(getApplication()).profileDao().insert(profileEntity)
+                                    cachedProfiles = null; cacheTimestamp = 0
                                     main.post { onSuccess(profileId) }
                                 } catch (e: Exception) {
-                                    main.post { onError("Saved to server but failed to save locally: ${e.message}") }
+                                    main.post { onError("Saved to server but failed locally: ${e.message}") }
                                 }
                             } else {
-                                // Server returned error (likely LAG ID duplicate from another device)
-                                val error = serverResult.exceptionOrNull()?.message ?: "Failed to save profile"
-                                Log.e("CardReaderViewModel", "✗ Server rejected: $error")
-                                main.post { onError(error) }
+                                main.post { onError(serverResult.exceptionOrNull()?.message ?: "Failed to save profile") }
                             }
                         }
                     } else {
-                        // Save locally only
-                        Log.d("CardReaderViewModel", "Step 2: Server offline, saving locally only...")
-
                         try {
-                            val profileId = AppDatabase.getInstance(getApplication())
-                                .profileDao()
-                                .insert(profileEntity)
-
-                            cachedProfiles = null
-                            cacheTimestamp = 0
-
-                            Log.d("CardReaderViewModel", "✓ Offline save successful: ID=$profileId")
-                            Log.d("CardReaderViewModel", "=== SAVE COMPLETE (OFFLINE) ===")
+                            val profileId = AppDatabase.getInstance(getApplication()).profileDao().insert(profileEntity)
+                            cachedProfiles = null; cacheTimestamp = 0
                             main.post { onSuccess(profileId) }
                         } catch (e: Exception) {
-                            Log.e("CardReaderViewModel", "✗ Local save failed", e)
                             main.post { onError(e.message ?: "Unknown error") }
                         }
                     }
                 }
-
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "✗ Error in saveProfile", e)
                 main.post { onError(e.message ?: "Unknown error") }
             }
         }
     }
 
     private fun checkForDuplicatesLocally(
-        lagId: String,
-        faceTemplate: ByteArray,
-        onResult: (isDuplicate: Boolean, duplicateType: String?, existingProfile: ProfileEntity?) -> Unit
+        lagId: String, faceTemplate: ByteArray,
+        onResult: (Boolean, String?, ProfileEntity?) -> Unit
     ) {
         dbExecutor.execute {
             try {
-                Log.d("CardReaderViewModel", "--- Duplicate Check Started ---")
+                val existingByLagId = AppDatabase.getInstance(getApplication()).profileDao().getProfileByLagId(lagId)
+                if (existingByLagId != null) { main.post { onResult(true, "LAG ID", existingByLagId) }; return@execute }
 
-                // CHECK LAG ID duplicate
-                Log.d("CardReaderViewModel", "Checking LAG ID: $lagId")
-                val existingByLagId = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getProfileByLagId(lagId)
+                val allProfiles = AppDatabase.getInstance(getApplication()).profileDao().getAllProfile()
+                if (allProfiles.isEmpty()) { main.post { onResult(false, null, null) }; return@execute }
 
-                if (existingByLagId != null) {
-                    Log.d("CardReaderViewModel", "✗ DUPLICATE LAG ID: ${existingByLagId.name}")
-                    main.post {
-                        onResult(true, "LAG ID", existingByLagId)
-                    }
-                    return@execute
-                }
-                Log.d("CardReaderViewModel", "✓ LAG ID is unique")
-
-                // Face template duplicate
-                Log.d("CardReaderViewModel", "Checking face template...")
-                val allProfiles = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getAllProfile()
-
-                if (allProfiles.isEmpty()) {
-                    Log.d("CardReaderViewModel", "✓ Database is empty, no face duplicates possible")
-                    main.post {
-                        onResult(false, null, null)
-                    }
-                    return@execute
-                }
-
-                Log.d("CardReaderViewModel", "Comparing against ${allProfiles.size} existing profiles")
-
-                // Create subject for the new face template
                 val newFaceSubject = NSubject()
                 newFaceSubject.setTemplateBuffer(NBuffer(faceTemplate))
+                var bestMatchScore = 0; var bestMatchProfile: ProfileEntity? = null
 
-                var bestMatchScore = 0
-                var bestMatchProfile: ProfileEntity? = null
-
-                // Check against each existing profile
-                allProfiles.forEachIndexed { index, profile ->
+                allProfiles.forEach { profile ->
                     try {
                         val existingSubject = NSubject()
                         existingSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
-
                         val matchStatus = biometricClient?.verify(newFaceSubject, existingSubject)
-
                         if (matchStatus == NBiometricStatus.OK) {
                             val score = newFaceSubject.matchingResults?.getOrNull(0)?.score ?: 0
-
-                            Log.d("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] ${profile.name}: Score = $score")
-
-                            if (score > bestMatchScore) {
-                                bestMatchScore = score
-                                bestMatchProfile = profile
-                            }
-                        } else {
-                            Log.d("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] ${profile.name}: No match (status: $matchStatus)")
+                            if (score > bestMatchScore) { bestMatchScore = score; bestMatchProfile = profile }
                         }
-                    } catch (e: Exception) {
-                        Log.e("CardReaderViewModel", "  [${index + 1}/${allProfiles.size}] Error comparing with ${profile.name}", e)
-                    }
+                    } catch (e: Exception) { Log.e("CardReaderViewModel", "Error comparing with ${profile.name}", e) }
                 }
 
-                val DUPLICATE_THRESHOLD = 90
-
-                if (bestMatchScore >= DUPLICATE_THRESHOLD && bestMatchProfile != null) {
-                    Log.d("CardReaderViewModel", " DUPLICATE FACE DETECTED!")
-                    main.post {
-                        onResult(true, "Face", bestMatchProfile)
-                    }
-                } else {
-                    Log.d("CardReaderViewModel", " Face is unique (score below threshold)")
-                    main.post {
-                        onResult(false, null, null)
-                    }
-                }
-
-                Log.d("CardReaderViewModel", " Duplicate Check Complete")
+                if (bestMatchScore >= 90 && bestMatchProfile != null) main.post { onResult(true, "Face", bestMatchProfile) }
+                else main.post { onResult(false, null, null) }
 
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", " Error checking duplicates", e)
-                main.post {
-                    onResult(false, null, null)
-                }
+                Log.e("CardReaderViewModel", "Error checking duplicates", e)
+                main.post { onResult(false, null, null) }
             }
         }
     }
-
-
 
     private fun createThumbnail(imageBytes: ByteArray): ByteArray {
         return try {
@@ -671,745 +832,306 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             val stream = ByteArrayOutputStream()
             thumbnail.compress(Bitmap.CompressFormat.JPEG, 60, stream)
             val result = stream.toByteArray()
-            stream.close()
-            thumbnail.recycle()
-            bitmap.recycle()
-            result
-        } catch (e: Exception) {
-            Log.e("CardReaderViewModel", "Error creating thumbnail", e)
-            imageBytes
-        }
+            stream.close(); thumbnail.recycle(); bitmap.recycle(); result
+        } catch (e: Exception) { imageBytes }
     }
 
-    // Helper function to compress face image more efficiently
     private fun compressFaceImage(imageBytes: ByteArray): ByteArray {
         return try {
             val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-
-            // Resize if too large (max 300x300 for storage)
-            val resizedBitmap = if (bitmap.width > 300 || bitmap.height > 300) {
+            val resized = if (bitmap.width > 300 || bitmap.height > 300) {
                 val ratio = minOf(300f / bitmap.width, 300f / bitmap.height)
-                val newWidth = (bitmap.width * ratio).toInt()
-                val newHeight = (bitmap.height * ratio).toInt()
-                Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
-            } else {
-                bitmap
-            }
-
-            // Compress with lower quality for storage
+                Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
+            } else bitmap
             val stream = java.io.ByteArrayOutputStream()
-            resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 75, stream)
-            val compressed = stream.toByteArray()
-            stream.close()
-
-            if (bitmap != resizedBitmap) {
-                resizedBitmap.recycle()
-            }
-            bitmap.recycle()
-
-            Log.d("CardReaderViewModel", "Image compressed from ${imageBytes.size} to ${compressed.size} bytes")
-            compressed
-        } catch (e: Exception) {
-            Log.e("CardReaderViewModel", "Error compressing image", e)
-            imageBytes // Return original if compression fails
-        }
+            resized.compress(Bitmap.CompressFormat.JPEG, 75, stream)
+            val compressed = stream.toByteArray(); stream.close()
+            if (bitmap != resized) resized.recycle(); bitmap.recycle(); compressed
+        } catch (e: Exception) { imageBytes }
     }
 
+    // Profile queries
 
     fun getAllProfile(callback: (List<ProfileEntity>) -> Unit, forceRefresh: Boolean = false) {
-        // If force refresh requested, clear cache first
-        if (forceRefresh) {
-            cachedProfiles = null
-            cacheTimestamp = 0
-        }
-
-        // If force refresh and server available, reload from server
+        if (forceRefresh) { cachedProfiles = null; cacheTimestamp = 0 }
         if (forceRefresh && isServerAvailable && !isSyncing) {
             isSyncing = true
-
             CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    // Reload from server
-                    val result = syncManager.loadAllProfilesFromServer()
-
-                    main.post {
-                        isSyncing = false
-
-                        // After server sync, get local profiles
-                        getLocalProfiles(callback)
-                    }
-                } catch (e: Exception) {
-                    Log.e("CardReaderViewModel", "Error syncing", e)
-                    main.post {
-                        isSyncing = false
-                        // Even if sync fails, return local data
-                        getLocalProfiles(callback)
-                    }
-                }
+                try { syncManager.loadAllProfilesFromServer() } catch (e: Exception) { }
+                main.post { isSyncing = false; getLocalProfiles(callback) }
             }
             return
         }
-
-        // Return cached data if still fresh
-        if (!forceRefresh && cachedProfiles != null &&
-            (System.currentTimeMillis() - cacheTimestamp) < CACHE_DURATION_MS) {
-            Log.d("CardReaderViewModel", "Returning cached profiles")
-            main.post { callback(cachedProfiles!!) }
-            return
+        if (!forceRefresh && cachedProfiles != null && (System.currentTimeMillis() - cacheTimestamp) < CACHE_DURATION_MS) {
+            main.post { callback(cachedProfiles!!) }; return
         }
-
-        // Otherwise get from local database
         getLocalProfiles(callback)
     }
 
     private fun getLocalProfiles(callback: (List<ProfileEntity>) -> Unit) {
         dbExecutor.execute {
             try {
-                val profileList = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getAllProfile()
-
-                cachedProfiles = profileList
-                cacheTimestamp = System.currentTimeMillis()
-
-                main.post {
-                    callback(profileList)
-                }
-            } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error getting profile", e)
-                main.post { callback(emptyList()) }
-            }
+                val profileList = AppDatabase.getInstance(getApplication()).profileDao().getAllProfile()
+                cachedProfiles = profileList; cacheTimestamp = System.currentTimeMillis()
+                main.post { callback(profileList) }
+            } catch (e: Exception) { main.post { callback(emptyList()) } }
         }
     }
 
     fun deleteProfile(profileId: Long, onComplete: () -> Unit) {
         dbExecutor.execute {
             try {
-                val profile = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getProfileById(profileId)
-
+                val profile = AppDatabase.getInstance(getApplication()).profileDao().getProfileById(profileId)
                 profile?.let { profileToDelete ->
-                    // Delete from local database
-                    AppDatabase.getInstance(getApplication())
-                        .profileDao()
-                        .delete(profileToDelete)
-
+                    AppDatabase.getInstance(getApplication()).profileDao().delete(profileToDelete)
                     cachedProfiles = null
-
-                    // Delete from server
                     if (isServerAvailable) {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            val result = syncManager.deleteProfileFromServer(profileToDelete.lagId)
-                            if (result.isSuccess) {
-                                Log.d("CardReaderViewModel", "Profile deleted from server")
-                            } else {
-                                Log.w("CardReaderViewModel", "Failed to delete from server: ${result.exceptionOrNull()}")
-                            }
-                        }
+                        CoroutineScope(Dispatchers.IO).launch { syncManager.deleteProfileFromServer(profileToDelete.lagId) }
                     }
-
                     main.post { onComplete() }
-                } ?: run {
-                    main.post {
-                        status = "Profile not found"
-                        onComplete()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error deleting profile", e)
-                main.post { onComplete() }
-            }
+                } ?: main.post { status = "Profile not found"; onComplete() }
+            } catch (e: Exception) { main.post { onComplete() } }
         }
     }
 
     fun refreshFromServer(onComplete: (Int, String?) -> Unit) {
-        if (!isServerAvailable) {
-            main.post { onComplete(0, "Server not available") }
-            return
-        }
-
-        if (isSyncing) {
-            main.post { onComplete(0, "Sync already in progress") }
-            return
-        }
-
+        if (!isServerAvailable) { main.post { onComplete(0, "Server not available") }; return }
+        if (isSyncing) { main.post { onComplete(0, "Sync already in progress") }; return }
         isSyncing = true
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val result = syncManager.loadAllProfilesFromServer()
-
                 main.post {
-                    isSyncing = false
-                    cachedProfiles = null
-
-                    if (result.isSuccess) {
-                        val count = result.getOrDefault(0)
-                        onComplete(count, null)
-                    } else {
-                        onComplete(0, result.exceptionOrNull()?.message ?: "Unknown error")
-                    }
+                    isSyncing = false; cachedProfiles = null
+                    if (result.isSuccess) onComplete(result.getOrDefault(0), null)
+                    else onComplete(0, result.exceptionOrNull()?.message ?: "Unknown error")
                 }
-            } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error refreshing", e)
-                main.post {
-                    isSyncing = false
-                    onComplete(0, e.message)
-                }
-            }
+            } catch (e: Exception) { main.post { isSyncing = false; onComplete(0, e.message) } }
         }
     }
-    init {
-        initializeSyncManager()
-    }
 
+    //  Face verification
 
     fun verifyFaceAgainstDatabase(onResult: (ProfileEntity?, Int) -> Unit) {
         executor.execute {
             try {
                 main.post { status = "Searching database..." }
-
-                // Get the captured face template
-                val capturedTemplate = capturedProfileTemplate
-                if (capturedTemplate == null) {
-                    main.post {
-                        status = "No captured face found"
-                        onResult(null, 0)
-                    }
-                    return@execute
+                val capturedTemplate = capturedProfileTemplate ?: run {
+                    main.post { status = "No captured face found"; onResult(null, 0) }; return@execute
                 }
-
-                // Get all staff from database
-                val allProfile = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getAllProfile()
-
-                if (allProfile.isEmpty()) {
-                    main.post {
-                        status = "No profile in database"
-                        onResult(null, 0)
-                    }
-                    return@execute
-                }
+                val allProfile = AppDatabase.getInstance(getApplication()).profileDao().getAllProfile()
+                if (allProfile.isEmpty()) { main.post { status = "No profile in database"; onResult(null, 0) }; return@execute }
 
                 main.post { status = "Comparing with ${allProfile.size} profiles..." }
+                val capturedSubject = NSubject(); capturedSubject.setTemplateBuffer(NBuffer(capturedTemplate))
+                var bestMatch: ProfileEntity? = null; var bestScore = 0
 
-                // Create subject for captured face
-                val capturedSubject = NSubject()
-                capturedSubject.setTemplateBuffer(NBuffer(capturedTemplate))
-
-                var bestMatch: ProfileEntity? = null
-                var bestScore = 0
-
-                // Match against each staff profile
-                allProfile.forEachIndexed { index, profile ->
+                allProfile.forEach { profile ->
                     try {
-                        val profileSubject = NSubject()
-                        profileSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
-
+                        val profileSubject = NSubject(); profileSubject.setTemplateBuffer(NBuffer(profile.faceTemplate))
                         val matchStatus = biometricClient?.verify(capturedSubject, profileSubject)
-
                         if (matchStatus == NBiometricStatus.OK) {
                             val score = capturedSubject.matchingResults?.getOrNull(0)?.score ?: 0
-                            if (score > bestScore) {
-                                bestScore = score
-                                bestMatch = profile
-                            }
+                            if (score > bestScore) { bestScore = score; bestMatch = profile }
                         }
-                    } catch (e: Exception) {
-                        Log.e("CardReaderViewModel", "Error matching with profile ${profile.name}", e)
-                    }
+                    } catch (e: Exception) { Log.e("CardReaderViewModel", "Error matching with ${profile.name}", e) }
                 }
 
-                val threshold = 48
-                val finalMatch = if (bestScore >= threshold) bestMatch else null
-
-                // Log face verification access
+                val finalMatch = if (bestScore >= 48) bestMatch else null
                 if (finalMatch != null) {
-                    logAccessAttempt(
-                        lagId = finalMatch.lagId,
-                        name = finalMatch.name,
-                        accessGranted = true,
-                        accessType = "FACE"
-                    )
-
-                    // Auto clock-in on successful face verification
-                    clockInOut(finalMatch.lagId, finalMatch.name, action = null) { success, message ->
-                        Log.d("CardReaderViewModel", "Auto clock-in: $message")
-                    }
+                    logAccessAttempt(lagId = finalMatch.lagId, name = finalMatch.name, accessGranted = true, accessType = "FACE")
+                    clockInOut(finalMatch.lagId, finalMatch.name, action = null) { _, msg -> Log.d("CardReaderViewModel", "Auto clock-in: $msg") }
                 } else {
-                    logAccessAttempt(
-                        lagId = "UNKNOWN",
-                        name = "Unknown",
-                        accessGranted = false,
-                        accessType = "FACE"
-                    )
+                    logAccessAttempt(lagId = "UNKNOWN", name = "Unknown", accessGranted = false, accessType = "FACE")
                 }
-
                 main.post {
-                    status = if (finalMatch != null) {
-                        "Match found: ${finalMatch.name} (Score: $bestScore)"
-                    } else if (bestScore > 0) {
-                        "No match found (Best score: $bestScore)"
-                    } else {
-                        "No match found"
-                    }
+                    status = if (finalMatch != null) "Match found: ${finalMatch.name} (Score: $bestScore)"
+                    else if (bestScore > 0) "No match found (Best score: $bestScore)" else "No match found"
                     onResult(finalMatch, bestScore)
                 }
-
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error during verification", e)
-                main.post {
-                    status = "Verification error: ${e.message}"
-                    onResult(null, 0)
-                }
+                main.post { status = "Verification error: ${e.message}"; onResult(null, 0) }
             }
         }
     }
 
+    // Image helpers
 
     private fun fixImageOrientation(context: Context, uri: Uri, bitmap: Bitmap): Bitmap {
         return try {
             val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
-            val exif = inputStream?.let { ExifInterface(it) }
-            inputStream?.close()
-
-            val orientation = exif?.getAttributeInt(
-                ExifInterface.TAG_ORIENTATION,
-                ExifInterface.ORIENTATION_NORMAL
-            ) ?: ExifInterface.ORIENTATION_NORMAL
-
+            val exif = inputStream?.let { ExifInterface(it) }; inputStream?.close()
+            val orientation = exif?.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) ?: ExifInterface.ORIENTATION_NORMAL
             val matrix = Matrix()
             when (orientation) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_90  -> matrix.postRotate(90f)
                 ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
                 ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
                 ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
-                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL   -> matrix.preScale(1f, -1f)
             }
-
-            if (!matrix.isIdentity) {
-                Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-            } else {
-                bitmap
-            }
-        } catch (e: Exception) {
-            Log.e("CardReaderViewModel", "Error fixing image orientation", e)
-            bitmap
-        }
+            if (!matrix.isIdentity) Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true) else bitmap
+        } catch (e: Exception) { bitmap }
     }
 
-    fun processFaceFromUri(
-        context: Context,
-        uri: Uri,
-        onSuccess: (Bitmap, ByteArray) -> Unit,
-        onError: (String) -> Unit
-    ) {
+    fun processFaceFromUri(context: Context, uri: Uri, onSuccess: (Bitmap, ByteArray) -> Unit, onError: (String) -> Unit) {
         executor.execute {
             try {
-                // Stop any ongoing capture to avoid conflicts
                 stopCapture()
-
-//                main.post { status = "Loading image..." }
-
-                // Read image from URI with options for faster decoding
                 val inputStream = context.contentResolver.openInputStream(uri)
-                val options = BitmapFactory.Options().apply {
-                    inJustDecodeBounds = false
-                    inSampleSize = calculateInSampleSize(this, 512, 512)
-                }
-
-                val originalBitmap = BitmapFactory.decodeStream(inputStream, null, options)
-                inputStream?.close()
-
-                if (originalBitmap == null) {
-                    main.post {
-                        status = "Failed to read image"
-                        onError("Failed to read image from gallery")
-                    }
-                    return@execute
-                }
-
-                // Fix orientation
+                val options = BitmapFactory.Options().apply { inJustDecodeBounds = false; inSampleSize = calculateInSampleSize(this, 512, 512) }
+                val originalBitmap = BitmapFactory.decodeStream(inputStream, null, options); inputStream?.close()
+                if (originalBitmap == null) { main.post { status = "Failed to read image"; onError("Failed to read image from gallery") }; return@execute }
                 val rotatedBitmap = fixImageOrientation(context, uri, originalBitmap)
-
-                // Show the image immediately
-                main.post {
-                    capturedProfileFace = rotatedBitmap
-//                    status = "Detecting face..."
-                }
-
-                // Ensure biometric client is initialized
+                main.post { capturedProfileFace = rotatedBitmap }
                 if (biometricClient == null) {
-                    Log.w("CardReaderViewModel", "Biometric client not initialized, initializing now...")
-                    try {
-                        NeurotecLicenseHelper.obtainFaceLicenses(context)
-                        // Initialize on main thread
-                        main.post { initClient() }
-                        // Wait for initialization
-                    } catch (e: Exception) {
-                        Log.e("CardReaderViewModel", "License initialization error", e)
-                    }
+                    try { NeurotecLicenseHelper.obtainFaceLicenses(context); main.post { initClient() } } catch (e: Exception) { }
                 }
-
-                if (biometricClient == null) {
-                    main.post {
-                        status = "System not ready"
-                        onError("Face detection system not initialized. Please try again.")
-                    }
-                    return@execute
-                }
-
-                // Convert bitmap to byte array
+                if (biometricClient == null) { main.post { status = "System not ready"; onError("Face detection system not initialized.") }; return@execute }
                 val stream = java.io.ByteArrayOutputStream()
                 rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
-                val imageBytes = stream.toByteArray()
-                stream.close()
-
-                // Process the face
+                val imageBytes = stream.toByteArray(); stream.close()
                 processFaceFromImage(imageBytes, rotatedBitmap, onSuccess, onError)
-
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error in processFaceFromUri", e)
-                e.printStackTrace()
-                main.post {
-                    status = "Error: ${e.message}"
-                    onError("Error reading image: ${e.message}")
-                }
+                main.post { status = "Error: ${e.message}"; onError("Error reading image: ${e.message}") }
             }
         }
     }
 
-    // Helper function to calculate sample size
     private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
-        val height = options.outHeight
-        val width = options.outWidth
-        var inSampleSize = 1
-
+        val height = options.outHeight; val width = options.outWidth; var inSampleSize = 1
         if (height > reqHeight || width > reqWidth) {
-            val halfHeight = height / 2
-            val halfWidth = width / 2
-
-            while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) {
-                inSampleSize *= 2
-            }
+            val halfHeight = height / 2; val halfWidth = width / 2
+            while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) inSampleSize *= 2
         }
-
         return inSampleSize
     }
 
-    fun processFaceFromImage(
-        imageBytes: ByteArray,
-        previewBitmap: Bitmap,
-        onSuccess: (Bitmap, ByteArray) -> Unit,
-        onError: (String) -> Unit
-    ) {
+    fun processFaceFromImage(imageBytes: ByteArray, previewBitmap: Bitmap, onSuccess: (Bitmap, ByteArray) -> Unit, onError: (String) -> Unit) {
         try {
-            Log.d("CardReaderViewModel", "Starting face detection from image")
-
-            // Convert byte array to NImage
             val nImage = NImage.fromMemory(NBuffer(imageBytes))
-            Log.d("CardReaderViewModel", "NImage created: ${nImage.width}x${nImage.height}")
-
-            // Create subject and face
-            val subject = NSubject()
-            val face = NFace()
-            face.image = nImage
-            subject.faces.add(face)
-
-            // Create task
-            val task = biometricClient?.createTask(
-                EnumSet.of(
-                    NBiometricOperation.DETECT_SEGMENTS,
-                    NBiometricOperation.CREATE_TEMPLATE
-                ),
-                subject
-            )
-
-            task?.let {
-                it.timeout = 15000 // 15 seconds timeout
-                Log.d("CardReaderViewModel", "Performing face detection...")
-                biometricClient?.performTask(it)
-                Log.d("CardReaderViewModel", "Task completed with status: ${it.status}")
-            }
-
-            val taskStatus = task?.status
-
-            when (taskStatus) {
+            val subject = NSubject(); val face = NFace(); face.image = nImage; subject.faces.add(face)
+            val task = biometricClient?.createTask(EnumSet.of(NBiometricOperation.DETECT_SEGMENTS, NBiometricOperation.CREATE_TEMPLATE), subject)
+            task?.let { it.timeout = 15000; biometricClient?.performTask(it) }
+            when (task!!.status) {
                 NBiometricStatus.OK -> {
                     val template = subject.templateBuffer?.toByteArray()
-
-                    if (template != null && template.isNotEmpty()) {
-                        Log.d("CardReaderViewModel", "Template extracted, size: ${template.size}")
-                        main.post {
-//                            status = "Image uploaded successfully!"
-                            onSuccess(previewBitmap, template)
-                        }
-                    } else {
-                        Log.e("CardReaderViewModel", "Template is null or empty")
-                        main.post {
-                            status = "Failed to create template"
-                            onError("Failed to extract face template from image")
-                        }
-                    }
+                    if (template != null && template.isNotEmpty()) main.post { onSuccess(previewBitmap, template) }
+                    else main.post { status = "Failed to create template"; onError("Failed to extract face template") }
                 }
-
-                NBiometricStatus.BAD_OBJECT -> {
-                    Log.w("CardReaderViewModel", "No face detected in image")
-                    main.post {
-                        status = "No face detected"
-                        onError("No face detected. Please select a clear photo with a visible face.")
-                    }
-                }
-
-                NBiometricStatus.TIMEOUT -> {
-                    Log.e("CardReaderViewModel", "Face detection timeout")
-                    main.post {
-                        status = "Processing timeout"
-                        onError("Processing took too long. Please try a different photo.")
-                    }
-                }
-
-                else -> {
-                    Log.e("CardReaderViewModel", "Face detection failed: $taskStatus")
-                    main.post {
-                        status = "Detection failed"
-                        onError("Could not detect face. Please try another photo.")
-                    }
-                }
+                NBiometricStatus.BAD_OBJECT -> main.post { status = "No face detected"; onError("No face detected. Use a clear photo.") }
+                NBiometricStatus.TIMEOUT    -> main.post { status = "Processing timeout"; onError("Processing took too long. Try a different photo.") }
+                else -> main.post { status = "Detection failed"; onError("Could not detect face. Try another photo.") }
             }
-
-            // Clean up
-            task?.dispose()
-            nImage.dispose()
-
+            task?.dispose(); nImage.dispose()
         } catch (e: Exception) {
-            Log.e("CardReaderViewModel", "Exception in processFaceFromImage", e)
-            e.printStackTrace()
-            main.post {
-                status = "Error: ${e.message}"
-                onError("Error processing face: ${e.message}")
-            }
+            main.post { status = "Error: ${e.message}"; onError("Error processing face: ${e.message}") }
         }
     }
+
+
+
+    // Card / access
 
     fun checkLagIdInDatabase(lagId: String, onResult: (ProfileEntity?, Boolean) -> Unit) {
         executor.execute {
             try {
                 main.post { status = "Verifying card..." }
-
-                val profile = AppDatabase.getInstance(getApplication())
-                    .profileDao()
-                    .getProfileByLagId(lagId)
-
+                val profile = AppDatabase.getInstance(getApplication()).profileDao().getProfileByLagId(lagId)
                 val exists = profile != null
-
-                // Log the access attempt
                 if (exists && profile != null) {
-                    logAccessAttempt(
-                        lagId = lagId,
-                        name = profile.name,
-                        accessGranted = true,
-                        accessType = "CARD"
-                    )
-
-                    // Auto clock-in on successful card tap
-                    clockInOut(lagId, profile.name, action = null) { success, message ->
-                        Log.d("CardReaderViewModel", "Auto clock-in: $message")
-                    }
-                }else {
-                    logAccessAttempt(
-                        lagId = lagId,
-                        name = "Unknown",
-                        accessGranted = false,
-                        accessType = "CARD"
-                    )
+                    logAccessAttempt(lagId = lagId, name = profile.name, accessGranted = true, accessType = "CARD")
+                    clockInOut(lagId, profile.name, action = null) { _, msg -> Log.d("CardReaderViewModel", "Auto clock-in: $msg") }
+                } else {
+                    logAccessAttempt(lagId = lagId, name = "Unknown", accessGranted = false, accessType = "CARD")
                 }
-
                 main.post {
-                    status = if (exists) {
-                        "Access Granted: ${profile?.name}"
-                    } else {
-                        "Access Denied: LAG ID not registered"
-                    }
+                    status = if (exists) "Access Granted: ${profile?.name}" else "Access Denied: LAG ID not registered"
                     onResult(profile, exists)
                 }
-
             } catch (e: Exception) {
-                Log.e("CardReaderViewModel", "Error checking LAG ID", e)
-                main.post {
-                    status = "Error checking card"
-                    onResult(null, false)
-                }
+                main.post { status = "Error checking card"; onResult(null, false) }
             }
         }
     }
 
-
-    // Log access attempt
     @SuppressLint("HardwareIds")
-    private fun logAccessAttempt(
-        lagId: String,
-        name: String,
-        accessGranted: Boolean,
-        accessType: String = "CARD"
-    ) {
+    private fun logAccessAttempt(lagId: String, name: String, accessGranted: Boolean, accessType: String = "CARD") {
         if (!isServerAvailable) return
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val deviceId = android.provider.Settings.Secure.getString(
-                    getApplication<Application>().contentResolver,
-                    android.provider.Settings.Secure.ANDROID_ID
-                )
-
+                    getApplication<Application>().contentResolver, android.provider.Settings.Secure.ANDROID_ID)
                 val localTimeZone = Calendar.getInstance()
-                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-                dateFormat.timeZone = localTimeZone.timeZone
-                val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                timeFormat.timeZone = localTimeZone.timeZone
-
-                val accessLog = AccessLog(
-                    lagId = lagId,
-                    name = name,
-                    accessGranted = accessGranted,
-                    accessType = accessType,
-                    deviceId = deviceId,
-                    timestamp = System.currentTimeMillis(),
-                    date = dateFormat.format(Date()),
-                    time = timeFormat.format(Date())
-                )
-
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).apply { timeZone = localTimeZone.timeZone }
+                val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).apply { timeZone = localTimeZone.timeZone }
+                val accessLog = AccessLog(lagId = lagId, name = name, accessGranted = accessGranted, accessType = accessType,
+                    deviceId = deviceId, timestamp = System.currentTimeMillis(),
+                    date = dateFormat.format(Date()), time = timeFormat.format(Date()))
                 val response = RetrofitClient.apiService.logAccess(accessLog)
-                if (response.isSuccessful) {
-                    Log.d("CardReaderViewModel", "Access logged: $name - ${if (accessGranted) "GRANTED" else "DENIED"}")
-                }
-            } catch (e: Exception) {
-                Log.d("CardReaderViewModel", "Failed to log access",e)
-            }
+                if (response.isSuccessful) Log.d("CardReaderViewModel", "Access logged: $name")
+            } catch (e: Exception) { Log.d("CardReaderViewModel", "Failed to log access", e) }
         }
     }
 
-    // Clock In/Out
-    fun clockInOut(
-        lagId: String,
-        name: String,
-        action: String? = null,
-        onResult: (Boolean, String) -> Unit
-    ) {
-        if (!isServerAvailable) {
-            main.post { onResult(false, "")}
-            return
-        }
-
+    fun clockInOut(lagId: String, name: String, action: String? = null, onResult: (Boolean, String) -> Unit) {
+        if (!isServerAvailable) { main.post { onResult(false, "") }; return }
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val clockAction = if (action != null) {
                     action
                 } else {
                     val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-
                     try {
-                        val statusResponse = RetrofitClient.apiService.getAttendance(
-                            lagId = lagId,
-                            startDate = today,
-                            endDate = today,
-                            limit = 1
-                        )
-
+                        val statusResponse = RetrofitClient.apiService.getAttendance(lagId = lagId, startDate = today, endDate = today, limit = 1)
                         if (statusResponse.isSuccessful) {
-                            val responseBody = statusResponse.body()
-
-                            val records = when {
-                                responseBody?.success == true ->
-                                    responseBody.records
-                                else -> emptyList()
-                            }
-
-                            val determinedAction = if (records.isEmpty()) {
-                                "IN"
-                            } else {
-                                val todayRecord = records.first()
-                                if (todayRecord.status == "ACTIVE") {
-                                    "OUT"
-                                } else {
-                                    // All sessions completed, clock in again
-                                    "IN"
-                                }
-                            }
-                            determinedAction
-                        } else {
-                            "IN"
-                        }
-                    } catch (e: Exception) {
-                        "IN"
-                    }
+                            val records = statusResponse.body()?.takeIf { it.success == true }?.records ?: emptyList()
+                            if (records.isEmpty()) "IN"
+                            else if (records.first().status == "ACTIVE") "OUT" else "IN"
+                        } else "IN"
+                    } catch (e: Exception) { "IN" }
                 }
-                val request = ClockRequest(lagId, name, clockAction)
-                val response = RetrofitClient.apiService.clockInOut(request)
-
+                val response = RetrofitClient.apiService.clockInOut(ClockRequest(lagId, name, clockAction))
                 main.post {
                     if (response.isSuccessful && response.body()?.success == true) {
-                        val responseBody = response.body()
-                        // Convert server timestamp to local time
-                        responseBody?.attendance?.let { attendance ->
-                            // Get the latest session
-                            val sessions = attendance.sessions
-                            if (!sessions.isNullOrEmpty()) {
-                                val latestSession = sessions.last()
-                                val serverTimestamp = if (clockAction == "IN") {
-                                    latestSession.clockIn
-                                } else {
-                                    latestSession.clockOut
-                                }
-                                serverTimestamp?.let { timestamp ->
-                                    val localTimeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).apply {
-                                        timeZone = TimeZone.getDefault()
-                                    }
-                                    val timeStr = localTimeFormat.format(Date(timestamp))
-
-                                    val message = if (clockAction == "IN") {
-                                        "Clocked in at $timeStr"
-                                    } else {
-                                        val sessionDuration = latestSession.durationFormatted ?: "0h 0m"
-                                        val totalDuration = attendance.totalDurationFormatted ?: "0h 0m"
-                                        "Clocked out at $timeStr\nSession: $sessionDuration\nTotal today: $totalDuration"
-                                    }
-                                    onResult(true, message)
-                                    return@post
-                                }
+                        val attendance = response.body()?.attendance
+                        val sessions = attendance?.sessions
+                        if (!sessions.isNullOrEmpty()) {
+                            val latestSession = sessions.last()
+                            val serverTimestamp = if (clockAction == "IN") latestSession.clockIn else latestSession.clockOut
+                            serverTimestamp?.let { timestamp ->
+                                val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).apply { timeZone = TimeZone.getDefault() }.format(Date(timestamp))
+                                val message = if (clockAction == "IN") "Clocked in at $timeStr"
+                                else "Clocked out at $timeStr\nSession: ${latestSession.durationFormatted ?: "0h 0m"}\nTotal today: ${attendance.totalDurationFormatted ?: "0h 0m"}"
+                                onResult(true, message); return@post
                             }
                         }
-                        onResult(true, " ") // Clocked in/out successfully
-                    } else {
-                        val error = response.body()?.message ?: "" // Failed to clock in/out
-                        onResult(false, error)
-                    }
+                        onResult(true, " ")
+                    } else { onResult(false, response.body()?.message ?: "") }
                 }
-            } catch (e: Exception) {
-                main.post {
-                    onResult(false, e.message ?: "Unknown error")
-                }
-            }
+            } catch (e: Exception) { main.post { onResult(false, e.message ?: "Unknown error") } }
         }
     }
 
-    fun invalidateCache() {
-        cachedProfiles = null
-        cacheTimestamp = 0
+    fun resetFingerprintSensorState() {
+        synchronized(sensorLock) {
+            isSensorOpen = false
+            fpManager = null
+        }
     }
 
+    // Misc
 
-    fun clearCapturedStaffFace() {
-        capturedProfileFace = null
-        capturedProfileTemplate = null
-    }
+    fun invalidateCache() { cachedProfiles = null; cacheTimestamp = 0 }
+    fun clearCapturedStaffFace() { capturedProfileFace = null; capturedProfileTemplate = null }
 
     override fun onCleared() {
         super.onCleared()
         stopCapture()
+        closeFingerprintSensor()
         executor.shutdown()
         biometricClient?.dispose()
     }
+
+    init { initializeSyncManager() }
 }

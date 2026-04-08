@@ -21,6 +21,9 @@ data class ProfileDTO(
     @SerializedName("thumbnail")
     val thumbnail: String? = null, // Base64 encoded
 
+    @SerializedName("fingerprintTemplate")
+    val fingerprintTemplate: String? = null,
+
     @SerializedName("timestamp")
     val timestamp: Long = System.currentTimeMillis()
 

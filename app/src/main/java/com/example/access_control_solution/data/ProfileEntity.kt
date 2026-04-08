@@ -15,6 +15,7 @@ data class ProfileEntity(
     val lagId: String,
     val faceTemplate: ByteArray,
     val faceImage: ByteArray,
+    val fingerprintTemplate: ByteArray? = null,
     val thumbnail: ByteArray? = null,
     val timestamp: Long = System.currentTimeMillis()
 
@@ -30,6 +31,10 @@ data class ProfileEntity(
         if (lagId != other.lagId) return false
         if (!faceTemplate.contentEquals(other.faceTemplate)) return false
         if (!faceImage.contentEquals(other.faceImage)) return false
+        if (fingerprintTemplate != null) {
+            if (other.fingerprintTemplate == null) return false
+            if (!fingerprintTemplate.contentEquals(other.fingerprintTemplate)) return false
+        } else if (other.fingerprintTemplate != null) return false
 
         return true
     }
