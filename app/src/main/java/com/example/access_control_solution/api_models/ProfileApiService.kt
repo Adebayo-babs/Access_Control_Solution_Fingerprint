@@ -5,6 +5,7 @@ import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
@@ -12,6 +13,12 @@ interface ProfileApiService {
 
     @POST("api/profiles")
     suspend fun saveProfile(@Body profile: ProfileDTO): Response<SaveProfileResponse>
+
+    @PUT("api/profiles/lagid/{lagId}")
+    suspend fun updateProfile(
+        @Path("lagId") lagId: String,
+        @Body profile: ProfileDTO
+    ): Response<SaveProfileResponse>
 
     @GET("api/profiles")
     suspend fun getAllProfiles(

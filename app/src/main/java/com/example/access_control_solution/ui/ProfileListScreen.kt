@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -74,7 +75,8 @@ import kotlinx.coroutines.withContext
 fun ProfileListScreen(
     viewModel: CardReaderViewModel,
     onBack: () -> Unit,
-    onAddProfile: () -> Unit
+    onAddProfile: () -> Unit,
+    onEditProfile: (ProfileEntity) -> Unit
 ) {
 
     BackHandler { onBack() }
@@ -374,6 +376,7 @@ fun ProfileListScreen(
                             items(profileList) { profile ->
                                 ProfileCard(
                                     profile = profile,
+                                    onEdit = { onEditProfile(profile) },
                                     onDelete = {
                                         profileToDelete = profile
                                         showDeleteDialog = true
@@ -443,6 +446,7 @@ fun ProfileListScreen(
 @Composable
 fun ProfileCard(
     profile: ProfileEntity,
+    onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -526,6 +530,19 @@ fun ProfileCard(
                     text = "Added: ${formatTimestamp(profile.timestamp)}",
                     fontSize = 12.sp,
                     color = Color.LightGray
+                )
+            }
+
+            // Edit Button
+            IconButton(
+                onClick = onEdit,
+                colors = IconButtonDefaults.iconButtonColors(
+                    contentColor = Color(0xFF2196F3)
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Edit,
+                    contentDescription = "Edit"
                 )
             }
 

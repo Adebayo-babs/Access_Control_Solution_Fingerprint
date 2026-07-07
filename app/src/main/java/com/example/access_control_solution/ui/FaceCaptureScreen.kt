@@ -1,9 +1,7 @@
 package com.example.access_control_solution.ui
 
-import android.graphics.Bitmap
 import android.util.Log
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,16 +33,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.example.access_control_solution.R
 import com.example.access_control_solution.data.ProfileEntity
 import com.example.access_control_solution.viewModel.CardReaderViewModel
@@ -58,14 +51,27 @@ fun FaceCaptureScreen(
     onBack: () -> Unit,
     viewModel: CardReaderViewModel,
     onPlayFaceDetectedSound: () -> Unit,
-    onVerificationComplete: ((ProfileEntity?, Int) -> Unit)? = null
+    onVerificationComplete: ((ProfileEntity?, Int) -> Unit)? = null,
+    isEnrollment: Boolean = false
 ) {
 
     BackHandler { onBack() }
 
     val context = LocalContext.current
     val status = viewModel.status
+    val detectionFeedback = viewModel.detectionFeedback
+    val isCapturing = viewModel.isCapturing
     val dialogState by viewModel.dialogState.collectAsState()
+
+    // `status` is only ever set for terminal states (errors, "no face detected",
+    // database verification progress). The live per-frame progress ("Looking for
+    // face...", "Perfect! Face captured!") lives in detectionFeedback instead, and
+    // only becomes meaningful once the capture loop has actually started.
+    val displayMessage = when {
+        status.isNotEmpty() -> status
+        isCapturing -> detectionFeedback.overallMessage
+        else -> "Initializing camera..."
+    }
 
 
     LaunchedEffect(Unit) {
@@ -73,10 +79,13 @@ fun FaceCaptureScreen(
         viewModel.onFaceDetectedSound = {
             onPlayFaceDetectedSound()
         }
+        // Flag this capture as enrollment-bound (or not) up front, so the ViewModel state
+        // survives navigation even after this screen is disposed.
+        viewModel.markPendingEnrollmentCapture(isEnrollment)
         viewModel.initialize()
     }
 
-    // Handle dialog auto-dismiss and trigger verification
+    // Handle dialog auto-dismiss and trigger verification (or hand back to caller for enrollment)
 
     LaunchedEffect(dialogState.showDialog) {
         if (dialogState.showDialog && dialogState.message.contains(
@@ -84,19 +93,31 @@ fun FaceCaptureScreen(
                 ignoreCase = true
             )
         ) {
-            // Trigger verification against database
-            onVerificationComplete?.let { callback ->
-                viewModel.verifyFaceAgainstDatabase { staff, score ->
+            when {
+                isEnrollment -> {
+                    // Face + template are already stored on the ViewModel by
+                    // startAutomaticCapture(). Give the user a beat to see the confirmation,
+                    // then hand control straight back to AddProfileScreen.
+                    delay(600)
+                    viewModel.hideDialog()
+                    viewModel.stopCapture()
+                    onBack()
+                }
+                onVerificationComplete != null -> {
+                    // Trigger verification against database
+                    viewModel.verifyFaceAgainstDatabase { staff, score ->
+                        viewModel.hideDialog()
+                        viewModel.reset()
+                        onVerificationComplete(staff, score)
+                    }
+                }
+                else -> {
+                    // If no callback provided, just dismiss and go back
+                    delay(3000)
                     viewModel.hideDialog()
                     viewModel.reset()
-                    callback(staff, score)
+                    onBack() // Navigate back to main menu
                 }
-            } ?: run {
-                // If no callback provided, just dismiss and go back
-                delay(3000)
-                viewModel.hideDialog()
-                viewModel.reset()
-                onBack() // Navigate back to main menu
             }
         }
     }
@@ -110,7 +131,7 @@ fun FaceCaptureScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Face Verification") },
+                title = { Text(if (isEnrollment) "Capture Face" else "Face Verification") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = Color(0xFF1C1C1C),
                     titleContentColor = Color.White
@@ -182,15 +203,18 @@ fun FaceCaptureScreen(
                         .padding(horizontal = 16.dp),
                     colors = CardDefaults.cardColors(
                         containerColor = when {
-                            status.contains("error", ignoreCase = true) -> Color(0xFFD32F2F)
-                            status.contains("success", ignoreCase = true) ||
-                                    status.contains("captured", ignoreCase = true) -> Color(
+                            displayMessage.contains("error", ignoreCase = true) -> Color(0xFFD32F2F)
+                            displayMessage.contains("success", ignoreCase = true) ||
+                                    displayMessage.contains("captured", ignoreCase = true) ||
+                                    displayMessage.contains("perfect", ignoreCase = true) -> Color(
                                 0xFF4CAF50
                             )
 
-                            status.contains("matching", ignoreCase = true) ||
-                                    status.contains("processing", ignoreCase = true) ||
-                                    status.contains("detecting", ignoreCase = true) -> Color(
+                            displayMessage.contains("matching", ignoreCase = true) ||
+                                    displayMessage.contains("processing", ignoreCase = true) ||
+                                    displayMessage.contains("detecting", ignoreCase = true) ||
+                                    displayMessage.contains("looking", ignoreCase = true) ||
+                                    displayMessage.contains("initializing", ignoreCase = true) -> Color(
                                 0xFF2196F3
                             )
 
@@ -206,9 +230,11 @@ fun FaceCaptureScreen(
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (status.contains("matching", ignoreCase = true) ||
-                            status.contains("processing", ignoreCase = true) ||
-                            status.contains("detecting", ignoreCase = true)
+                        if (displayMessage.contains("matching", ignoreCase = true) ||
+                            displayMessage.contains("processing", ignoreCase = true) ||
+                            displayMessage.contains("detecting", ignoreCase = true) ||
+                            displayMessage.contains("looking", ignoreCase = true) ||
+                            displayMessage.contains("initializing", ignoreCase = true)
                         ) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(20.dp),
@@ -219,7 +245,7 @@ fun FaceCaptureScreen(
                         }
 
                         Text(
-                            text = status.ifEmpty { "Initializing camera..." },
+                            text = displayMessage,
                             color = Color.White,
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Medium

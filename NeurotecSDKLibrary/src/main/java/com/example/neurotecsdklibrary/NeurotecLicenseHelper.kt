@@ -9,6 +9,9 @@ object NeurotecLicenseHelper {
 
     private const val TAG = "NeurotecLicense"
 
+    // Where the .lic file(s) live inside app/src/main/assets
+    private const val ASSET_LICENSE_DIR = "Licenses"
+
     // Face licenses
     const val LICENSE_FACE_DETECTION = "Biometrics.FaceDetection"
     const val LICENSE_FACE_EXTRACTION = "Biometrics.FaceExtraction"
@@ -31,12 +34,45 @@ object NeurotecLicenseHelper {
 
     private val allComponents = faceLicenseComponents + fingerLicenseComponents
 
+    // Copies any .lic file(s) bundled in app/src/main/assets/Licenses into
+    // filesDir/Licenses if they aren't already there. filesDir is app-private
+    // internal storage that gets wiped on uninstall, so this makes every fresh
+    // install (or reinstall) self-heal instead of silently failing to activate.
+    private fun ensureLicensesCopiedFromAssets(context: Context) {
+        val licenseDir = File(context.filesDir, "Licenses")
+        if (!licenseDir.exists()) {
+            licenseDir.mkdirs()
+        }
+
+        try {
+            val assetFiles = context.assets.list(ASSET_LICENSE_DIR) ?: emptyArray()
+            if (assetFiles.isEmpty()) {
+                Log.w(TAG, "No license files found in assets/$ASSET_LICENSE_DIR")
+                return
+            }
+
+            assetFiles.forEach { fileName ->
+                val destFile = File(licenseDir, fileName)
+                if (!destFile.exists()) {
+                    context.assets.open("$ASSET_LICENSE_DIR/$fileName").use { input ->
+                        destFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    Log.d(TAG, "Copied license from assets into filesDir: $fileName")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to copy licenses from assets", e)
+        }
+    }
+
     // Obtain face licenses
     fun obtainFaceLicenses(context: Context): Boolean {
         return try {
             Log.d(TAG, "Starting License Activation")
 
-//            NLicenseManager.setTrialMode(true)
+            ensureLicensesCopiedFromAssets(context)
 
             var faceExtraction = NLicense.isComponentActivated(LICENSE_FACE_EXTRACTION)
             var faceMatching = NLicense.isComponentActivated(LICENSE_FACE_MATCHING)
@@ -80,7 +116,7 @@ object NeurotecLicenseHelper {
         return try {
             Log.d(TAG, "Starting License Activation")
 
-//            NLicenseManager.setTrialMode(true)
+            ensureLicensesCopiedFromAssets(context)
 
             var fingerExtraction = NLicense.isComponentActivated(LICENSE_FINGER_EXTRACTION)
             var fingerMatching = NLicense.isComponentActivated(LICENSE_FINGER_MATCHING)

@@ -22,12 +22,12 @@ class MatchApplication : Application() {
         System.setProperty("neurotec.plugin.fingers.disable", "true")
         System.setProperty("neurotec.plugin.fingers.zkteco.disable", "true")
 
-        try {
-            NLicenseManager.setTrialMode(true)
-            Log.d("NeurotecLicense", "Trial mode enabled")
-        } catch (e: Exception) {
-            Log.e("NeurotecLicense", "Failed to set trial mode", e)
-        }
+//        try {
+//            NLicenseManager.setTrialMode(true)
+//            Log.d("NeurotecLicense", "Trial mode enabled")
+//        } catch (e: Exception) {
+//            Log.e("NeurotecLicense", "Failed to set trial mode", e)
+//        }
 
         try {
             NCore.setContext(this@MatchApplication)

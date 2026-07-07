@@ -2,10 +2,7 @@ package com.example.access_control_solution.ui
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.net.Uri
 import android.util.Log
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -47,7 +44,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,32 +58,35 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.bitel.api.Fingerprint
 import com.example.access_control_solution.FingerprintCaptureState
-import com.example.access_control_solution.TelpoFingerprintManager
+import com.example.access_control_solution.data.ProfileEntity
 import com.example.access_control_solution.viewModel.CardReaderViewModel
-import com.example.neurotecsdklibrary.NeurotecLicenseHelper
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.Executors
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddProfileScreen(
     viewModel: CardReaderViewModel,
     onBack: () -> Unit,
-    onProfileAdded: () -> Unit
+    onProfileAdded: () -> Unit,
+    onCaptureFace: () -> Unit, // Navigates to FaceCaptureScreen(isEnrollment = true)
+    existingProfile: ProfileEntity? = null // Non-null => edit mode
 ) {
     val context = LocalContext.current
+    val isEditMode = existingProfile != null
 
-    var name by remember { mutableStateOf("") }
-    var lagId by remember { mutableStateOf("") }
-    var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
-    var capturedFace by remember { mutableStateOf<Bitmap?>(null) }
-    var capturedTemplate by remember { mutableStateOf<ByteArray?>(null) }
+    var name by remember { mutableStateOf(existingProfile?.name ?: "") }
+    var lagId by remember { mutableStateOf(existingProfile?.lagId ?: "") }
+    var capturedFace by remember {
+        mutableStateOf(
+            existingProfile?.faceImage?.let { bytes ->
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        )
+    }
+    var capturedTemplate by remember { mutableStateOf(existingProfile?.faceTemplate) }
 
-    // Fingerprint state
-    var fingerprintTemplate by remember { mutableStateOf<ByteArray?>(null) }
+    // Fingerprint state — pre-filled from the existing profile when editing
+    var fingerprintTemplate by remember { mutableStateOf(existingProfile?.fingerprintTemplate) }
     var fingerprintBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isFingerprintSensorReady by remember { mutableStateOf(false) }
 
@@ -118,7 +117,7 @@ fun AddProfileScreen(
         }
     }
 
-    // Auto-fill face image from
+    // Auto-fill face image from card
     LaunchedEffect(faceImageFromCard) {
         faceImageFromCard?.let { bytes ->
             // Detect image format by checking magic bytes
@@ -139,7 +138,7 @@ fun AddProfileScreen(
                 capturedFace = bmp
                 isProcessing = true
 
-                val jpegBytes = ByteArrayOutputStream().use { out ->
+                val jpegBytes = java.io.ByteArrayOutputStream().use { out ->
                     bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
                     out.toByteArray()
                 }
@@ -175,7 +174,7 @@ fun AddProfileScreen(
                         capturedFace = jpegBmp
                         isProcessing = true
 
-                        val reEncodedJpeg = ByteArrayOutputStream().use { out ->
+                        val reEncodedJpeg = java.io.ByteArrayOutputStream().use { out ->
                             jpegBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
                             out.toByteArray()
                         }
@@ -246,7 +245,7 @@ fun AddProfileScreen(
 
     // Handle fingerprint capture state changes
     LaunchedEffect(fpCaptureState) {
-        when(val state = fpCaptureState) {
+        when (val state = fpCaptureState) {
             is FingerprintCaptureState.Success -> {
                 fingerprintTemplate = state.template
                 fingerprintBitmap = state.image
@@ -260,11 +259,20 @@ fun AddProfileScreen(
 
     }
 
-//    val status by remember { derivedStateOf { viewModel.status } }
-//
-//
-    // Clean up when screen is first loaded
+    // Clean up / set up when screen is (re)loaded.
+    // If we're returning from FaceCaptureScreen with a face captured for THIS screen
+    // (flagged via viewModel.pendingEnrollmentCapture), adopt it before doing anything else.
     LaunchedEffect(Unit) {
+        if (viewModel.pendingEnrollmentCapture) {
+            val pendingFace = viewModel.capturedProfileFace
+            val pendingTemplate = viewModel.capturedProfileTemplate
+            if (pendingFace != null && pendingTemplate != null) {
+                capturedFace = pendingFace
+                capturedTemplate = pendingTemplate
+                errorMessage = ""
+            }
+            viewModel.markPendingEnrollmentCapture(false)
+        }
         viewModel.clearCapturedStaffFace()
         viewModel.stopCapture()
         viewModel.hideDialog()
@@ -282,48 +290,16 @@ fun AddProfileScreen(
     DisposableEffect(Unit) {
         onDispose {
             viewModel.stopCapture()
-            viewModel.clearCapturedStaffFace()
             viewModel.clearCardData()
             viewModel.resetFingerprintCapture()
             viewModel.closeFingerprintSensor()
         }
     }
 
-    // Image picker launcher
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            selectedImageUri = it
-            isProcessing = true
-            capturedFace = null
-            capturedTemplate = null
-
-            // Process the selected image to extract face template
-            viewModel.processFaceFromUri(
-                context = context,
-                uri = it,
-                onSuccess = { bitmap, template ->
-                    capturedFace = bitmap
-                    capturedTemplate = template
-                    isProcessing = false
-                    errorMessage = ""
-                },
-                onError = { error ->
-                    errorMessage = error
-                    isProcessing = false
-                    selectedImageUri = null
-                    capturedFace = null
-                    capturedTemplate = null
-                }
-            )
-        }
-    }
-    
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Add Profile") },
+                title = { Text(if (isEditMode) "Edit Profile" else "Add Profile") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, "Back")
@@ -375,19 +351,20 @@ fun AddProfileScreen(
             Spacer(Modifier.height(16.dp))
 
             // Face Photo
-            Text("Face Photo",
+            Text(
+                "Face Photo",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.Gray,
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(modifier = Modifier.height(8.dp))
-            // Profile Picture Section
+            // Profile Picture Section — tap to open the live camera capture screen
             Card(
                 modifier = Modifier
                     .size(200.dp)
                     .clickable(enabled = !isProcessing && !isSaving) {
-                        imagePickerLauncher.launch("image/*")
+                        onCaptureFace()
                     },
                 shape = CircleShape,
                 colors = CardDefaults.cardColors(
@@ -410,7 +387,7 @@ fun AddProfileScreen(
                         capturedFace != null -> {
                             Image(
                                 bitmap = capturedFace!!.asImageBitmap(),
-                                contentDescription = "Selected Face",
+                                contentDescription = "Captured Face",
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop
                             )
@@ -421,13 +398,13 @@ fun AddProfileScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Person,
-                                    contentDescription = "Select Photo",
+                                    contentDescription = "Capture Photo",
                                     modifier = Modifier.size(64.dp),
                                     tint = Color.Gray
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
-                                    text = "Tap to select\nprofile photo",
+                                    text = "Tap to capture\nface photo",
                                     fontSize = 14.sp,
                                     color = Color.Gray,
                                     textAlign = TextAlign.Center
@@ -440,10 +417,10 @@ fun AddProfileScreen(
 
             if (capturedFace != null && !isProcessing) {
                 TextButton(onClick = {
-                    capturedFace = null; capturedTemplate = null; selectedImageUri = null; errorMessage = ""
-                    imagePickerLauncher.launch("image/*")
+                    capturedFace = null; capturedTemplate = null; errorMessage = ""
+                    onCaptureFace()
                 }, enabled = !isSaving) {
-                    Text("Change Photo", color = Color(0xFF2196F3), fontSize = 14.sp)
+                    Text("Retake Photo", color = Color(0xFF2196F3), fontSize = 14.sp)
                 }
             }
 
@@ -504,10 +481,6 @@ fun AddProfileScreen(
                                         fontSize = 15.sp, fontWeight = FontWeight.Bold,
                                         color = Color(0xFF2E7D32)
                                     )
-//                                    Text(
-//                                        "${fingerprintTemplate!!.size} bytes",
-//                                        fontSize = 12.sp, color = Color.Gray
-//                                    )
                                 }
                             }
                             Spacer(Modifier.height(8.dp))
@@ -553,8 +526,6 @@ fun AddProfileScreen(
                         }
                         else -> {
                             // Not yet enrolled
-//                            Text("👆", fontSize = 48.sp)
-//                            Spacer(Modifier.height(8.dp))
                             Text(
                                 "No fingerprint enrolled\n(optional — tap card or scan manually)",
                                 fontSize = 13.sp, color = Color.Gray, textAlign = TextAlign.Center
@@ -619,10 +590,10 @@ fun AddProfileScreen(
                     if (isSaving) return@Button
                     errorMessage = ""
                     when {
-                        name.isBlank()  -> errorMessage = "Please enter name"
+                        name.isBlank() -> errorMessage = "Please enter name"
                         lagId.isBlank() -> errorMessage = "Please enter LAG ID"
                         capturedFace == null || capturedTemplate == null ->
-                            errorMessage = "Please select or capture a face photo"
+                            errorMessage = "Please capture a face photo"
                         else -> {
                             isSaving = true
                             Log.d("AddProfileScreen", "Saving profile - fingerprintTemplate: ${fingerprintTemplate?.size ?: "NULL"}")
@@ -631,20 +602,40 @@ fun AddProfileScreen(
                                 capturedFace!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, s)
                                 s.toByteArray()
                             }
-                            viewModel.saveProfile(
-                                name = name.trim(),
-                                lagId = lagId.trim(),
-                                faceTemplate = capturedTemplate!!,
-                                faceImage = imageBytes,
-                                fingerprintTemplate = fingerprintTemplate,
-                                onSuccess = { isSaving = false; showSuccessDialog = true },
-                                onError = { err ->
-                                    isSaving = false
-                                    if (err.contains("already registered", ignoreCase = true)) {
-                                        duplicateMessage = err; showDuplicateDialog = true
-                                    } else errorMessage = "Error: $err"
-                                }
-                            )
+                            if (isEditMode) {
+                                viewModel.updateProfile(
+                                    profileId = existingProfile!!.id,
+                                    name = name.trim(),
+                                    lagId = lagId.trim(),
+                                    faceTemplate = capturedTemplate!!,
+                                    faceImage = imageBytes,
+                                    fingerprintTemplate = fingerprintTemplate,
+                                    originalTimestamp = existingProfile.timestamp,
+                                    originalLagId = existingProfile.lagId,
+                                    onSuccess = { isSaving = false; showSuccessDialog = true },
+                                    onError = { err ->
+                                        isSaving = false
+                                        if (err.contains("already registered", ignoreCase = true)) {
+                                            duplicateMessage = err; showDuplicateDialog = true
+                                        } else errorMessage = "Error: $err"
+                                    }
+                                )
+                            } else {
+                                viewModel.saveProfile(
+                                    name = name.trim(),
+                                    lagId = lagId.trim(),
+                                    faceTemplate = capturedTemplate!!,
+                                    faceImage = imageBytes,
+                                    fingerprintTemplate = fingerprintTemplate,
+                                    onSuccess = { isSaving = false; showSuccessDialog = true },
+                                    onError = { err ->
+                                        isSaving = false
+                                        if (err.contains("already registered", ignoreCase = true)) {
+                                            duplicateMessage = err; showDuplicateDialog = true
+                                        } else errorMessage = "Error: $err"
+                                    }
+                                )
+                            }
                         }
                     }
                 },
@@ -660,9 +651,9 @@ fun AddProfileScreen(
             ) {
                 if (isSaving) {
                     CircularProgressIndicator(Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
-                    Spacer(Modifier.width(12.dp)); Text("Saving…")
+                    Spacer(Modifier.width(12.dp)); Text(if (isEditMode) "Updating…" else "Saving…")
                 } else {
-                    Text("Save Profile", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text(if (isEditMode) "Update Profile" else "Save Profile", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 }
             }
 
@@ -697,24 +688,29 @@ fun AddProfileScreen(
                         }
                     },
                     text = {
-                        Text("Profile for $name has been added.", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                        Text(
+                            if (isEditMode) "Profile for $name has been updated."
+                            else "Profile for $name has been added.",
+                            textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+                        )
                     },
                     confirmButton = {
                         TextButton(onClick = { showSuccessDialog = false; onProfileAdded() }) {
                             Text("View All Profiles", color = Color(0xFF00A86B))
                         }
                     },
-                    dismissButton = {
-                        TextButton(onClick = {
-                            showSuccessDialog = false
-                            name = ""; lagId = ""; capturedFace = null; capturedTemplate = null
-                            selectedImageUri = null; fingerprintTemplate = null; fingerprintBitmap = null
-                            errorMessage = ""; isSaving = false
-//                            viewModel.resetFingerprintCapture()
-                        }) {
-                            Text("Add Another", color = Color(0xFF2196F3))
+                    dismissButton = if (!isEditMode) {
+                        @Composable {
+                            TextButton(onClick = {
+                                showSuccessDialog = false
+                                name = ""; lagId = ""; capturedFace = null; capturedTemplate = null
+                                fingerprintTemplate = null; fingerprintBitmap = null
+                                errorMessage = ""; isSaving = false
+                            }) {
+                                Text("Add Another", color = Color(0xFF2196F3))
+                            }
                         }
-                    }
+                    } else null
                 )
             }
         }

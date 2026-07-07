@@ -153,6 +153,17 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     var capturedProfileTemplate: ByteArray? = null
         private set
 
+    // Distinguishes an enrollment-bound capture (AddProfileScreen) from a plain
+    // verification capture, so AddProfileScreen only auto-adopts a face it actually
+    // requested, and a leftover verification capture never leaks into a later
+    // Add/Edit Profile session.
+    var pendingEnrollmentCapture by mutableStateOf(false)
+        private set
+
+    fun markPendingEnrollmentCapture(pending: Boolean) {
+        pendingEnrollmentCapture = pending
+    }
+
     private var cachedProfiles: List<ProfileEntity>? = null
     private var cacheTimestamp: Long = 0
     private val CACHE_DURATION_MS = 30000L
@@ -216,6 +227,8 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
                 setProperty("Faces.DetectAllFeaturePoints", "false")
                 setProperty("Faces.RecognizeExpression", "false")
 
+                Log.d("CardReaderViewModel", "initialize() called - isInit=$isInitialized isCamInit=$isCameraClientInitialized client=${biometricClient != null}")
+
                 initialize()
             }
 
@@ -239,6 +252,7 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
             biometricClient?.faceCaptureDevice = this.cameras[activeCameraIndex]
 
             isInitialized = true
+            isCameraClientInitialized = true
 
             main.postDelayed({
                 startAutomaticCapture()
@@ -787,16 +801,94 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    // Update an existing profile (used by AddProfileScreen in edit mode).
+    // `originalTimestamp` preserves the profile's original "date added" instead of
+    // bumping it to now.
+    fun updateProfile(
+        profileId: Long,
+        name: String,
+        lagId: String,
+        faceTemplate: ByteArray,
+        faceImage: ByteArray,
+        fingerprintTemplate: ByteArray? = null,
+        originalTimestamp: Long,
+        originalLagId: String,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        dbExecutor.execute {
+            try {
+                Log.d("CardReaderViewModel", "updateProfile called for id=$profileId")
+                val compressedImage = compressFaceImage(faceImage)
+                val thumbnail = createThumbnail(faceImage)
+
+                checkForDuplicatesLocally(lagId, faceTemplate, excludeProfileId = profileId) { isDuplicate, duplicateType, existingProfile ->
+                    if (isDuplicate) {
+                        val errorMsg = when (duplicateType) {
+                            "LAG ID" -> "LAG ID '$lagId' is already registered to ${existingProfile?.name}"
+                            "Face"   -> "This face is already registered as ${existingProfile?.name}"
+                            else     -> "Profile already exists"
+                        }
+                        main.post { onError(errorMsg) }
+                        return@checkForDuplicatesLocally
+                    }
+
+                    val updatedProfile = ProfileEntity(
+                        id = profileId,
+                        name = name,
+                        lagId = lagId,
+                        faceTemplate = faceTemplate,
+                        faceImage = compressedImage,
+                        thumbnail = thumbnail,
+                        fingerprintTemplate = fingerprintTemplate,
+                        timestamp = originalTimestamp
+                    )
+
+                    if (isServerAvailable) {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val serverResult = syncManager.updateProfileOnServer(updatedProfile, originalLagId)
+                            if (serverResult.isSuccess) {
+                                try {
+                                    AppDatabase.getInstance(getApplication()).profileDao().update(updatedProfile)
+                                    cachedProfiles = null; cacheTimestamp = 0
+                                    main.post { onSuccess() }
+                                } catch (e: Exception) {
+                                    main.post { onError("Updated on server but failed locally: ${e.message}") }
+                                }
+                            } else {
+                                main.post { onError(serverResult.exceptionOrNull()?.message ?: "Failed to update profile") }
+                            }
+                        }
+                    } else {
+                        try {
+                            AppDatabase.getInstance(getApplication()).profileDao().update(updatedProfile)
+                            cachedProfiles = null; cacheTimestamp = 0
+                            main.post { onSuccess() }
+                        } catch (e: Exception) {
+                            main.post { onError(e.message ?: "Unknown error") }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                main.post { onError(e.message ?: "Unknown error") }
+            }
+        }
+    }
+
     private fun checkForDuplicatesLocally(
         lagId: String, faceTemplate: ByteArray,
+        excludeProfileId: Long? = null,
         onResult: (Boolean, String?, ProfileEntity?) -> Unit
     ) {
         dbExecutor.execute {
             try {
                 val existingByLagId = AppDatabase.getInstance(getApplication()).profileDao().getProfileByLagId(lagId)
-                if (existingByLagId != null) { main.post { onResult(true, "LAG ID", existingByLagId) }; return@execute }
+                if (existingByLagId != null && existingByLagId.id != excludeProfileId) {
+                    main.post { onResult(true, "LAG ID", existingByLagId) }; return@execute
+                }
 
                 val allProfiles = AppDatabase.getInstance(getApplication()).profileDao().getAllProfile()
+                    .filter { it.id != excludeProfileId }
                 if (allProfiles.isEmpty()) { main.post { onResult(false, null, null) }; return@execute }
 
                 val newFaceSubject = NSubject()

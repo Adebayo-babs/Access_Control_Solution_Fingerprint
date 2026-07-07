@@ -117,6 +117,52 @@ class ProfileSyncManager(private val context: Context) {
         }
     }
 
+    // Update an existing profile on the server via PUT /api/profiles/lagid/{originalLagId}.
+    // `originalLagId` identifies which server record to update — it may differ from
+    // `profile.lagId` if the person changed the LAG ID as part of this edit.
+    suspend fun updateProfileOnServer(profile: ProfileEntity, originalLagId: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val profileDTO = entityToDTO(profile, includeImages = true)
+                val response = apiService.updateProfile(originalLagId, profileDTO)
+
+                if (response.isSuccessful) {
+                    val body = response.body()
+                    if (body?.success == true) {
+                        val profileId = body.profileId ?: originalLagId
+                        Log.d(TAG, "Profile updated on server successfully: $profileId")
+                        Result.success(profileId)
+                    } else {
+                        val errorMsg = body?.error ?: "Unknown server error"
+                        Log.e(TAG, "Server returned error updating profile: $errorMsg")
+                        Result.failure(Exception(errorMsg))
+                    }
+                } else {
+                    val errorBody = response.errorBody()?.string()
+                    Log.e(TAG, "HTTP ${response.code()} error updating profile. Body: $errorBody")
+
+                    if (errorBody != null) {
+                        try {
+                            val gson = com.google.gson.Gson()
+                            val errorResponse = gson.fromJson(errorBody, ErrorResponse::class.java)
+                            val errorMessage = errorResponse.error ?: "Server error: ${response.code()}"
+                            Log.e(TAG, "Parsed error message: $errorMessage")
+                            Result.failure(Exception(errorMessage))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to parse error body", e)
+                            Result.failure(Exception("Server error: ${response.code()} - $errorBody"))
+                        }
+                    } else {
+                        Result.failure(Exception("Server error: ${response.code()}"))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating profile on server", e)
+                Result.failure(e)
+            }
+        }
+    }
+
     // Load all profiles from server and replace local database
     suspend fun loadAllProfilesFromServer(): Result<Int> {
         return withContext(Dispatchers.IO) {

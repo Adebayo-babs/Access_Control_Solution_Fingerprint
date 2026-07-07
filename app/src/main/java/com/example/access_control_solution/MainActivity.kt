@@ -82,6 +82,7 @@ class MainActivity : ComponentActivity() {
         MAIN_MENU,
         FACE_CAPTURE,
         ADD_PROFILE,
+        ADD_PROFILE_FACE_CAPTURE,
         PROFILE_LIST,
         VERIFICATION_RESULT,
         ACCESS_RESULT,
@@ -102,6 +103,9 @@ class MainActivity : ComponentActivity() {
 
     // Flag to track which screen is active for NFC handling
     private var isAddProfileScreenActive by mutableStateOf(false)
+
+    // Profile currently being edited (null => AddProfileScreen is in "add" mode)
+    private var profileToEdit by mutableStateOf<ProfileEntity?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -140,6 +144,7 @@ class MainActivity : ComponentActivity() {
                                     currentScreen = Screen.FACE_CAPTURE
                                 },
                                 onNavigateToAddProfile = {
+                                    profileToEdit = null
                                     isAddProfileScreenActive = true
                                     currentScreen = Screen.ADD_PROFILE
                                 },
@@ -149,7 +154,7 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onChangeSAMPassword = { saveSAMPassword(it) },
 
-                            )
+                                )
 
                         }
 
@@ -183,16 +188,38 @@ class MainActivity : ComponentActivity() {
                         Screen.ADD_PROFILE -> {
                             AddProfileScreen(
                                 viewModel = viewModel,
+                                existingProfile = profileToEdit,
                                 onBack = {
                                     isAddProfileScreenActive = false
+                                    profileToEdit = null
                                     currentScreen = Screen.MAIN_MENU
-                                         },
+                                },
                                 onProfileAdded = {
                                     isAddProfileScreenActive = false
+                                    profileToEdit = null
                                     // Invalidate cache before navigating
                                     viewModel.invalidateCache()
                                     currentScreen = Screen.PROFILE_LIST
+                                },
+                                onCaptureFace = {
+                                    currentScreen = Screen.ADD_PROFILE_FACE_CAPTURE
                                 }
+                            )
+                        }
+
+                        Screen.ADD_PROFILE_FACE_CAPTURE -> {
+                            // isAddProfileScreenActive stays true here so an NFC tap that
+                            // happens to land mid-capture still routes to Add Profile handling.
+                            FaceCaptureScreen(
+                                viewModel = viewModel,
+                                onBack = {
+                                    currentScreen = Screen.ADD_PROFILE
+                                },
+                                onPlayFaceDetectedSound = {
+                                    val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 1000)
+                                    toneGen.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 1000)
+                                },
+                                isEnrollment = true
                             )
                         }
 
@@ -201,6 +228,12 @@ class MainActivity : ComponentActivity() {
                                 viewModel = viewModel,
                                 onBack = { currentScreen = Screen.MAIN_MENU },
                                 onAddProfile = {
+                                    profileToEdit = null
+                                    isAddProfileScreenActive = true
+                                    currentScreen = Screen.ADD_PROFILE
+                                },
+                                onEditProfile = { profile ->
+                                    profileToEdit = profile
                                     isAddProfileScreenActive = true
                                     currentScreen = Screen.ADD_PROFILE
                                 }
