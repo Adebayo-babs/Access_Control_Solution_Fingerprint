@@ -91,13 +91,12 @@ object NeurotecLicenseHelper {
                     }
                 }
 
-                faceLicenseComponents.forEach { component ->
-                    try {
-                        val obtained = NLicense.obtainComponents("/local", "5000", component)
-                        Log.d(TAG, "$component activation = $obtained")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error activating $component", e)
-                    }
+                val allFaceComponentsJoined = faceLicenseComponents.joinToString(",")
+                try {
+                    val obtained = NLicense.obtainComponents("/local", "5000", allFaceComponentsJoined)
+                    Log.d(TAG, "$allFaceComponentsJoined activation = $obtained")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error activating $allFaceComponentsJoined", e)
                 }
             }
 
@@ -135,13 +134,12 @@ object NeurotecLicenseHelper {
                     }
                 }
 
-                fingerLicenseComponents.forEach { component ->
-                    try {
-                        val obtained = NLicense.obtainComponents("/local", "5000", component)
-                        Log.d(TAG, "$component activation = $obtained")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error activating $component", e)
-                    }
+                val allFingerComponentsJoined = fingerLicenseComponents.joinToString(",")
+                try {
+                    val obtained = NLicense.obtainComponents("/local", "5000", allFingerComponentsJoined)
+                    Log.d(TAG, "$allFingerComponentsJoined activation = $obtained")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error activating $allFingerComponentsJoined", e)
                 }
             }
 
