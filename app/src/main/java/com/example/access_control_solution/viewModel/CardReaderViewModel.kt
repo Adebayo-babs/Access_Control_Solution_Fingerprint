@@ -20,7 +20,9 @@ import com.example.access_control_solution.FingerprintCaptureState
 import com.example.access_control_solution.FingerprintVerifyState
 import com.example.access_control_solution.TelpoFingerprintManager
 import com.example.access_control_solution.api_models.AccessLog
+import com.example.access_control_solution.api_models.AuthTokenHolder
 import com.example.access_control_solution.api_models.ClockRequest
+import com.example.access_control_solution.api_models.LoginRequest
 import com.example.access_control_solution.api_models.ProfileSyncManager
 import com.example.access_control_solution.api_models.RetrofitClient
 import com.example.access_control_solution.data.AppDatabase
@@ -171,6 +173,16 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
     private lateinit var syncManager: ProfileSyncManager
     var isServerAvailable by mutableStateOf(false)
     private var isSyncing by mutableStateOf(false)
+
+    // Admin auth state
+    private val authPrefs by lazy {
+        getApplication<Application>().getSharedPreferences("AuthPrefs", Context.MODE_PRIVATE)
+    }
+    private val _isLoggedIn = MutableStateFlow(false)
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    private val _adminUsername = MutableStateFlow<String?>(null)
+    val adminUsername: StateFlow<String?> = _adminUsername.asStateFlow()
 
     private var isSensorOpen = false
     private val sensorLock = Any()
@@ -739,6 +751,60 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         _fingerprintVerifyState.value = FingerprintVerifyState.Idle
     }
 
+    // Admin auth
+
+    private fun restoreAuthSession() {
+        val storedToken = authPrefs.getString("token", null)
+        val storedUsername = authPrefs.getString("username", null)
+        if (!storedToken.isNullOrEmpty()) {
+            AuthTokenHolder.token = storedToken
+            _isLoggedIn.value = true
+            _adminUsername.value = storedUsername
+        }
+    }
+
+    fun login(username: String, password: String, onResult: (Boolean, String?) -> Unit) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val response = RetrofitClient.apiService.login(LoginRequest(username, password))
+                val body = response.body()
+                if (response.isSuccessful && body?.success == true && body.token != null) {
+                    AuthTokenHolder.token = body.token
+                    authPrefs.edit()
+                        .putString("token", body.token)
+                        .putString("username", body.admin?.username ?: username)
+                        .apply()
+                    main.post {
+                        _isLoggedIn.value = true
+                        _adminUsername.value = body.admin?.username ?: username
+                        onResult(true, null)
+                    }
+                } else {
+                    val errorMsg = body?.error ?: "Invalid credentials"
+                    main.post { onResult(false, errorMsg) }
+                }
+            } catch (e: Exception) {
+                Log.e("CardReaderViewModel", "Login error", e)
+                main.post { onResult(false, e.message ?: "Network error. Please try again.") }
+            }
+        }
+    }
+
+    fun logout() {
+        AuthTokenHolder.token = null
+        authPrefs.edit().clear().apply()
+        _isLoggedIn.value = false
+        _adminUsername.value = null
+        // Best-effort server-side logout log; don't block on it or fail if offline
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                RetrofitClient.apiService.logout()
+            } catch (e: Exception) {
+                Log.d("CardReaderViewModel", "Logout call failed (likely offline): ${e.message}")
+            }
+        }
+    }
+
     // Save profile
 
     fun saveProfile(
@@ -1225,5 +1291,8 @@ class CardReaderViewModel(application: Application) : AndroidViewModel(applicati
         biometricClient?.dispose()
     }
 
-    init { initializeSyncManager() }
+    init {
+        initializeSyncManager()
+        restoreAuthSession()
+    }
 }

@@ -32,6 +32,7 @@ import com.example.access_control_solution.ui.AddProfileScreen
 import com.example.access_control_solution.ui.CardAccessResultScreen
 import com.example.access_control_solution.ui.FaceCaptureScreen
 import com.example.access_control_solution.ui.FingerprintVerificationScreen
+import com.example.access_control_solution.ui.LoginScreen
 import com.example.access_control_solution.ui.MainMenuScreen
 import com.example.access_control_solution.ui.ProfileListScreen
 import com.example.access_control_solution.ui.SplashScreen
@@ -86,8 +87,12 @@ class MainActivity : ComponentActivity() {
         PROFILE_LIST,
         VERIFICATION_RESULT,
         ACCESS_RESULT,
-        FINGERPRINT_VERIFY
+        FINGERPRINT_VERIFY,
+        LOGIN
     }
+
+    // Where to go after a successful login (PROFILE_LIST or ADD_PROFILE)
+    private var pendingDestinationAfterLogin by mutableStateOf<Screen?>(null)
 
     private var toneGenerator: ToneGenerator? = null
     private var currentScreen by mutableStateOf(Screen.SPLASH)
@@ -145,10 +150,18 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onNavigateToAddProfile = {
                                     profileToEdit = null
-                                    isAddProfileScreenActive = true
-                                    currentScreen = Screen.ADD_PROFILE
+                                    if (viewModel.isLoggedIn.value) {
+                                        isAddProfileScreenActive = true
+                                        currentScreen = Screen.ADD_PROFILE
+                                    } else {
+                                        pendingDestinationAfterLogin = Screen.ADD_PROFILE
+                                        currentScreen = Screen.LOGIN
+                                    }
                                 },
-                                onNavigateToProfileList = { currentScreen = Screen.PROFILE_LIST },
+                                onNavigateToProfileList = {
+                                    pendingDestinationAfterLogin = Screen.PROFILE_LIST
+                                    currentScreen = Screen.LOGIN
+                                },
                                 onNavigateToFingerprintVerify = {
                                     currentScreen = Screen.FINGERPRINT_VERIFY
                                 },
@@ -223,19 +236,47 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
+                        Screen.LOGIN -> {
+                            LoginScreen(
+                                viewModel = viewModel,
+                                onLoginSuccess = {
+                                    val destination = pendingDestinationAfterLogin ?: Screen.MAIN_MENU
+                                    pendingDestinationAfterLogin = null
+                                    if (destination == Screen.ADD_PROFILE) {
+                                        isAddProfileScreenActive = true
+                                    }
+                                    currentScreen = destination
+                                },
+                                onCancel = {
+                                    pendingDestinationAfterLogin = null
+                                    currentScreen = Screen.MAIN_MENU
+                                }
+                            )
+                        }
+
                         Screen.PROFILE_LIST -> {
                             ProfileListScreen(
                                 viewModel = viewModel,
                                 onBack = { currentScreen = Screen.MAIN_MENU },
                                 onAddProfile = {
                                     profileToEdit = null
-                                    isAddProfileScreenActive = true
-                                    currentScreen = Screen.ADD_PROFILE
+                                    if (viewModel.isLoggedIn.value) {
+                                        isAddProfileScreenActive = true
+                                        currentScreen = Screen.ADD_PROFILE
+                                    } else {
+                                        pendingDestinationAfterLogin = Screen.ADD_PROFILE
+                                        currentScreen = Screen.LOGIN
+                                    }
                                 },
                                 onEditProfile = { profile ->
                                     profileToEdit = profile
-                                    isAddProfileScreenActive = true
-                                    currentScreen = Screen.ADD_PROFILE
+                                    if (viewModel.isLoggedIn.value) {
+                                        isAddProfileScreenActive = true
+                                        currentScreen = Screen.ADD_PROFILE
+                                    } else {
+                                        pendingDestinationAfterLogin = Screen.ADD_PROFILE
+                                        currentScreen = Screen.LOGIN
+                                    }
                                 }
                             )
                         }

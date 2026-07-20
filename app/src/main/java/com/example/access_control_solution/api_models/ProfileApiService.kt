@@ -90,5 +90,13 @@ interface ProfileApiService {
     @GET("api/health")
     suspend fun healthCheck(): Response<ApiResponse<String>>
 
+    @POST("api/auth/login")
+    suspend fun login(@Body request: LoginRequest): Response<LoginResponse>
+
+    @GET("api/auth/verify")
+    suspend fun verifyToken(): Response<VerifyResponse>
+
+    @POST("api/auth/logout")
+    suspend fun logout(): Response<ApiResponse<Unit>>
 
 }
